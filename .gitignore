@@ -1,0 +1,13 @@
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# 运行时产物
+robot_test_output/
+runs/detect/
+
+# 训练时自动下载的基座权重
+yolov8n.pt
+weights/
+*.cache
