@@ -13,8 +13,8 @@ from collections import Counter
 SRC = "/home/kkka/桌面/数据标注"
 DST = "yolo_dataset"
 
-# 类别顺序：0 smoking, 1 safety_sign, 2 fire_extinguisher, 3 safety_sign_not
-CLASSES = ["smoking", "safety_sign", "fire_extinguisher", "safety_sign_not"]
+# 类别顺序：0 smoking, 1 safety_sign, 2 fire_extinguisher
+CLASSES = ["smoking", "safety_sign", "fire_extinguisher"]
 
 
 def reset_dir(path):
@@ -87,11 +87,8 @@ def convert_smoking_coco(project_dir, class_id):
     print(f"  smoking: train={saved['train']} val={saved['val']} 无框图片={empty} 非法框={bad}")
 
 
-def convert_existing_yolo(project_dir, class_name, new_class_id, skip_empty=False):
-    """已是 YOLO 格式的标签，重映射类别 id 后复制
-
-    skip_empty=True 时，没有标注框的图片直接跳过（不当作背景负样本）
-    """
+def convert_existing_yolo(project_dir, class_name, new_class_id):
+    """已是 YOLO 格式的标签，重映射类别 id 后复制"""
     img_dir = os.path.join(project_dir, "images")
     lbl_dir = os.path.join(project_dir, "labels")
     saved = Counter()
@@ -133,11 +130,6 @@ def convert_existing_yolo(project_dir, class_name, new_class_id, skip_empty=Fals
         else:
             print(f"  ⚠️ 标签缺失: {stem}")
 
-        if skip_empty and not lines:
-            os.remove(os.path.join(DST, "images", split, out_stem + ".jpg"))
-            empty += 1
-            continue
-
         if not lines:
             empty += 1
         with open(os.path.join(DST, "labels", split, out_stem + ".txt"), "w") as f:
@@ -174,11 +166,6 @@ def main():
     fe_project = os.path.join(
         SRC, "fire_extinguisher", "project-4-at-2026-10-22-05-06-1f557770")
     convert_existing_yolo(fe_project, "fire_extinguisher", 2)
-
-    print("▶ 整理 safety_sign_not (重映射为 3)")
-    ssn_project = os.path.join(
-        SRC, "safety_sign_not", "project-5-at-2026-10-23-11-46-36cb3dc2")
-    convert_existing_yolo(ssn_project, "safety_sign_not", 3, skip_empty=True)
 
     # data.yaml（不写 path，Ultralytics 会以 yaml 所在目录为数据集根，保证仓库可移植）
     yaml_path = os.path.join(DST, "data.yaml")
