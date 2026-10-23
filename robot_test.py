@@ -11,13 +11,14 @@
     export ROS_DOMAIN_ID=0 RMW_IMPLEMENTATION=rmw_fastrtps_cpp
     python3 robot_test.py [--topic /ob_camera_head/color/image_raw/compressed]
 
-通用参数: --conf 0.4 --imgsz 640 --save-every 10 --max-frames 0 --no-show
-按 q 或 ESC 退出。
+通用参数: --conf 0.65（指示牌/灭火器） --conf-smoking 0.25（吸烟） --imgsz 640 --roi 0 --save-every 10 --max-frames 0 --no-show
+按 q 或 ESC 退出，点窗口叉号也可退出。
 """
 import argparse
 import os
 import socket
 import struct
+import threading
 import time
 from collections import Counter
 
@@ -45,15 +46,24 @@ COLORS = [(0, 0, 255), (0, 200, 0), (255, 128, 0), (255, 0, 255)]
 FONT_PATH = "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc"
 FONT = ImageFont.truetype(FONT_PATH, 20) if os.path.exists(FONT_PATH) else None
 
+# ===== 检测阈值配置（部署后现场微调只改这里，也可用命令行参数临时覆盖）=====
+CONF_SMOKING = 0.25   # 吸烟：放宽阈值优先保证能检出，代价是弱误框可能变多
+CONF_OTHER = 0.65     # 安全指示牌 / 灭火器：收紧阈值压制误检
+
 
 def parse_args():
     p = argparse.ArgumentParser()
     p.add_argument("--model",
-                   default="runs/train_3cls/weights/best.pt")
+                   default="runs/train_3cls_v2/weights/best.pt")
     p.add_argument("--tcp", default="", help="TCP 中继地址，如 192.168.22.50:5000")
     p.add_argument("--topic", default="", help="ROS 相机话题，留空自动发现")
-    p.add_argument("--conf", type=float, default=0.4)
+    p.add_argument("--conf", type=float, default=CONF_OTHER,
+                   help="指示牌、灭火器的显示阈值，调高可压误检")
+    p.add_argument("--conf-smoking", type=float, default=CONF_SMOKING,
+                   help="吸烟的显示阈值，调低更灵敏（代价是纸盒等弱误框可能变多）")
     p.add_argument("--imgsz", type=int, default=640)
+    p.add_argument("--roi", type=float, default=0.0,
+                   help="只检测画面中央区域（如 0.5 = 中央一半宽高），相当于数字变焦，利于远处的烟头等小目标")
     p.add_argument("--device", default="0", help="0 为 GPU，cpu 为 CPU")
     p.add_argument("--save-dir", default="robot_test_output")
     p.add_argument("--save-every", type=int, default=10)
@@ -121,16 +131,20 @@ def find_camera_topic(node):
     return None, False
 
 
-def draw(img, result, names):
+def draw(img, result, names, conf_by_class, offset=(0, 0)):
     counts = Counter()
     boxes = []
+    ox, oy = offset
     for box in result.boxes:
         cls_id = int(box.cls)
         conf = float(box.conf)
         name = names[cls_id]
+        # 每类单独阈值：吸烟放宽，其他类收紧
+        if conf < conf_by_class.get(name, 0.0):
+            continue
         counts[name] += 1
         x1, y1, x2, y2 = [int(v) for v in box.xyxy[0]]
-        boxes.append((cls_id, conf, name, x1, y1, x2, y2))
+        boxes.append((cls_id, conf, name, x1 + ox, y1 + oy, x2 + ox, y2 + oy))
 
     if FONT is not None:
         # PIL 渲染中文标签（cv2.putText 不支持中文）
@@ -146,7 +160,7 @@ def draw(img, result, names):
             ty = max(y1 - th - 8, 0)
             drawer.rectangle([x1, ty, x1 + tw + 8, ty + th + 8], fill=rgb)
             drawer.text((x1 + 4, ty + 2), label, font=FONT, fill=(255, 255, 255))
-        return counts, cv2.cvtColor(np.array(pil), cv2.COLOR_RGB2BGR)
+        return counts, cv2.cvtColor(np.array(pil), cv2.COLOR_RGB2BGR), boxes
 
     for cls_id, conf, name, x1, y1, x2, y2 in boxes:
         color = COLORS[cls_id % len(COLORS)]
@@ -156,7 +170,7 @@ def draw(img, result, names):
         cv2.rectangle(img, (x1, max(y1 - th - 6, 0)), (x1 + tw + 4, y1), color, -1)
         cv2.putText(img, label, (x1 + 2, max(y1 - 4, th)),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
-    return counts, img
+    return counts, img, boxes
 
 
 class Output:
@@ -167,6 +181,13 @@ class Output:
         self.args = args
         self.model = model
         self.names = names
+        # 每类显示阈值：吸烟单独放宽
+        self.conf_by_class = {
+            name: (args.conf_smoking if name == "smoking" else args.conf)
+            for name in names.values()
+        }
+        # 推理阈值取最低的一档，再由 draw 按类过滤
+        self.infer_conf = min(self.conf_by_class.values())
         self.csv_path = os.path.join(args.save_dir, "detections.csv")
         self.csv_file = open(self.csv_path, "w", newline="", encoding="utf-8")
         self.writer = csv_writer(self.csv_file)
@@ -179,16 +200,24 @@ class Output:
         self.fps = 0.0
 
     def handle(self, img):
-        result = self.model.predict(img, imgsz=self.args.imgsz, conf=self.args.conf,
+        offset = (0, 0)
+        infer_img = img
+        if self.args.roi > 0:
+            h, w = img.shape[:2]
+            cw, ch = int(w * self.args.roi), int(h * self.args.roi)
+            ox, oy = (w - cw) // 2, (h - ch) // 2
+            offset = (ox, oy)
+            infer_img = img[oy:oy + ch, ox:ox + cw]
+
+        result = self.model.predict(infer_img, imgsz=self.args.imgsz, conf=self.infer_conf,
                                     device=self.args.device, verbose=False)[0]
-        counts, img = draw(img, result, self.names)
+        counts, img, boxes = draw(img, result, self.names, self.conf_by_class, offset)
         self.total.update(counts)
 
         now = time.strftime("%H:%M:%S")
-        for box in result.boxes:
-            x1, y1, x2, y2 = [int(v) for v in box.xyxy[0]]
-            self.writer.writerow([self.frame_idx, now, self.names[int(box.cls)],
-                                  f"{float(box.conf):.3f}", x1, y1, x2, y2])
+        for _, conf, name, x1, y1, x2, y2 in boxes:
+            self.writer.writerow([self.frame_idx, now, name,
+                                  f"{conf:.3f}", x1, y1, x2, y2])
 
         self.frame_idx += 1
         self.fps_frames += 1
@@ -205,8 +234,14 @@ class Output:
             self.saved += 1
 
         if not self.args.no_show:
-            cv2.imshow("YOLO Robot Test (q to quit)", img)
+            cv2.imshow(WINDOW_NAME, img)
             if cv2.waitKey(1) & 0xFF in (ord("q"), 27):
+                return False
+            try:
+                # 点窗口右上角叉号关闭时，可见性会变成 0
+                if cv2.getWindowProperty(WINDOW_NAME, cv2.WND_PROP_VISIBLE) < 1:
+                    return False
+            except cv2.error:
                 return False
         return True
 
@@ -221,6 +256,9 @@ class Output:
         print(f"带框图保存: {self.saved} 张 -> {self.args.save_dir}")
         print(f"检测日志: {self.csv_path}")
         print("=" * 50)
+
+
+WINDOW_NAME = "YOLO Robot Test (q to quit)"
 
 
 def csv_writer(f):
@@ -254,16 +292,37 @@ def run_tcp(args, out):
             time.sleep(2)
 
     try:
-        while True:
-            header = recv_exact(sock, 4)
-            if header is None:
-                print("中继连接已断开")
-                break
-            size = struct.unpack(">I", header)[0]
-            payload = recv_exact(sock, size)
+        sock.settimeout(None)  # 读帧线程用阻塞模式，保证整帧完整
+        latest = [None]
+        lock = threading.Lock()
+        stop = threading.Event()
+
+        def reader():
+            while not stop.is_set():
+                try:
+                    header = recv_exact(sock, 4)
+                    if header is None:
+                        print("中继连接已断开")
+                        break
+                    size = struct.unpack(">I", header)[0]
+                    payload = recv_exact(sock, size)
+                    if payload is None:
+                        print("中继连接中断")
+                        break
+                except OSError:
+                    break
+                with lock:
+                    latest[0] = payload  # 只保留最新帧，旧的直接丢弃
+            stop.set()
+
+        threading.Thread(target=reader, daemon=True).start()
+
+        while not stop.is_set():
+            with lock:
+                payload, latest[0] = latest[0], None
             if payload is None:
-                print("中继连接中断")
-                break
+                time.sleep(0.002)
+                continue
             img = cv2.imdecode(np.frombuffer(payload, dtype=np.uint8), cv2.IMREAD_COLOR)
             if img is None:
                 continue
@@ -322,6 +381,7 @@ def main():
     from ultralytics import YOLO
     model = YOLO(args.model)
     print(f"模型加载完成，类别: {model.names}")
+    print(f"阈值: 吸烟 {args.conf_smoking}，指示牌/灭火器 {args.conf}")
 
     if not args.tcp and ROS_OK:
         rclpy.init()
