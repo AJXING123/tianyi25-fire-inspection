@@ -23,9 +23,35 @@
 
 from __future__ import annotations
 
+import hashlib
+import itertools
+import logging
 import time
 
 from .types import SpeechResult, SpeechState
+
+# 结构化日志：默认静默（NullHandler），由调用方/测试按需挂载 handler。
+# 约定：不记录完整播报文本（只记长度+sha1 前缀），不记录任何敏感信息，
+# 日志异常绝不影响巡检主流程（统一经 _safe_log 包裹）。
+_LOG = logging.getLogger("inspection.speaker")
+_LOG.addHandler(logging.NullHandler())
+
+# 全局单调请求序号：连续多次播报可用 req_id 区分（跨实例亦可区分）
+_REQ_COUNTER = itertools.count(1)
+
+
+def _text_ref(text: str) -> str:
+    """播报文本的安全摘要：长度 + sha1 前 8 位，不含原文。"""
+    digest = hashlib.sha1(text.encode("utf-8", "ignore")).hexdigest()[:8]
+    return f"len={len(text)},sha1={digest}"
+
+
+def _safe_log(level: int, msg: str, *args) -> None:
+    """日志失败/格式化异常静默吞掉，不得影响巡检主流程。"""
+    try:
+        _LOG.log(level, msg, *args)
+    except Exception:
+        pass
 
 TTS_SERVICE = "/intelligent_interaction/tts/play"
 # audio_config.json 中定义：audio_guide priority=4 interruptible=true（巡检播报用）
@@ -139,34 +165,49 @@ class TtsSpeaker(SpeakerBase):
 
     def say(self, text: str, interrupt: bool = True) -> SpeechResult:
         t0 = time.monotonic()
+        req_id = f"tts-{next(_REQ_COUNTER):04d}"
+        _safe_log(logging.INFO, "tts[%s] start interrupt=%s %s audio_id=%s",
+                  req_id, interrupt, _text_ref(text), self._audio_id)
 
         # 提交阶段：interrupt=True 须先发 stop(空 text) 打断当前播报，
         # 再 append(目标文本)。禁止把 stop 与非空 text 组合成单步"打断并播报"，
         # 平台会忽略带 text 的 stop（返回 success 但不发声）。
         if interrupt:
             # best-effort：stop 失败不阻塞 append（对齐迎宾实现）
-            self._call("", "stop")
+            stop_ok, _ = self._call("", "stop")
+            _safe_log(logging.DEBUG, "tts[%s] stop ok=%s", req_id, stop_ok)
 
         ok, resp = self._call(text, "append")
         if not ok:
+            elapsed = time.monotonic() - t0
+            _safe_log(logging.WARNING,
+                      "tts[%s] final=submit_failed reason=call_exception "
+                      "elapsed=%.3fs", req_id, elapsed)
             return SpeechResult(
                 state=SpeechState.SUBMIT_FAILED, text=text,
                 submit_success=False, submit_status=f"call exception: {resp}",
-                elapsed_s=time.monotonic() - t0,
+                elapsed_s=elapsed,
             )
         if not getattr(resp, "success", False):
+            elapsed = time.monotonic() - t0
+            _safe_log(logging.WARNING,
+                      "tts[%s] final=submit_failed status=%r elapsed=%.3fs",
+                      req_id, getattr(resp, "status", ""), elapsed)
             return SpeechResult(
                 state=SpeechState.SUBMIT_FAILED, text=text,
                 submit_success=False,
                 submit_status=getattr(resp, "status", ""),
-                elapsed_s=time.monotonic() - t0,
+                elapsed_s=elapsed,
             )
 
         submit_status = getattr(resp, "status", "")
+        _safe_log(logging.INFO, "tts[%s] submit ok status=%r",
+                  req_id, submit_status)
         # 提交成功 ≠ 在播。轮询 query，必须先观测到 playing，再连续稳定非 playing
         # （SETTLE_S 防抖）才判定 DONE_OBSERVED。
         saw_playing = False
         idle_since = None  # 首次观测到非 playing 的时间戳（用于防抖）
+        last_raw = None    # 上次 query 原始状态（仅变化时记日志，不增加查询）
         est_dur = max(EST_MIN_DUR_S, len(text) * EST_CHAR_RATE)
         # 从未观测到 playing 时，按估算时长+宽容提前结束，不等满硬超时。
         # 注意：估算到期只能返回 SUBMIT_UNCONFIRMED，不得伪造 DONE_OBSERVED。
@@ -177,11 +218,19 @@ class TtsSpeaker(SpeakerBase):
             now = time.monotonic()
             ok, playing, raw = self._is_playing()
             if not ok:
+                _safe_log(logging.WARNING,
+                          "tts[%s] final=query_error raw=%r elapsed=%.3fs",
+                          req_id, raw, now - t0)
                 return SpeechResult(
                     state=SpeechState.QUERY_ERROR, text=text,
                     submit_success=True, submit_status=submit_status,
                     elapsed_s=now - t0,
                 )
+            if raw != last_raw:
+                _safe_log(logging.DEBUG,
+                          "tts[%s] query raw=%r playing=%s elapsed=%.3fs",
+                          req_id, raw, playing, now - t0)
+                last_raw = raw
             if playing:
                 saw_playing = True
                 idle_since = None
@@ -190,6 +239,10 @@ class TtsSpeaker(SpeakerBase):
                     if idle_since is None:
                         idle_since = now
                     elif now - idle_since >= SETTLE_S:
+                        _safe_log(
+                            logging.INFO,
+                            "tts[%s] final=done_observed saw_playing=True "
+                            "elapsed=%.3fs", req_id, now - t0)
                         return SpeechResult(
                             state=SpeechState.DONE_OBSERVED, text=text,
                             submit_success=True, submit_status=submit_status,
@@ -199,6 +252,11 @@ class TtsSpeaker(SpeakerBase):
                 else:
                     # 从未观测到 playing：到估算期限则放弃等待（不伪造完成）
                     if now >= est_deadline:
+                        _safe_log(
+                            logging.WARNING,
+                            "tts[%s] final=submit_unconfirmed "
+                            "saw_playing=False elapsed=%.3fs",
+                            req_id, now - t0)
                         return SpeechResult(
                             state=SpeechState.SUBMIT_UNCONFIRMED, text=text,
                             submit_success=True, submit_status=submit_status,
@@ -208,16 +266,24 @@ class TtsSpeaker(SpeakerBase):
 
         # 硬超时
         if saw_playing:
+            elapsed = time.monotonic() - t0
+            _safe_log(logging.WARNING,
+                      "tts[%s] final=query_timeout saw_playing=True "
+                      "elapsed=%.3fs", req_id, elapsed)
             return SpeechResult(
                 state=SpeechState.QUERY_TIMEOUT, text=text,
                 submit_success=True, submit_status=submit_status,
                 observed_transition=True,
-                elapsed_s=time.monotonic() - t0,
+                elapsed_s=elapsed,
             )
+        elapsed = time.monotonic() - t0
+        _safe_log(logging.WARNING,
+                  "tts[%s] final=submit_unconfirmed saw_playing=False "
+                  "elapsed=%.3fs", req_id, elapsed)
         return SpeechResult(
             state=SpeechState.SUBMIT_UNCONFIRMED, text=text,
             submit_success=True, submit_status=submit_status,
-            elapsed_s=time.monotonic() - t0,
+            elapsed_s=elapsed,
         )
 
 
