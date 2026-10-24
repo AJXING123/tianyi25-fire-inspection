@@ -103,14 +103,24 @@ class YoloInspector(InspectorBase):
                  camera_name: str = "head",
                  frame_timeout: float = 3.0,
                  inference_timeout: float = 10.0,
-                 min_conf: float = 0.5):
+                 min_conf: float = 0.5,
+                 conf_by_class: Optional[dict] = None,
+                 to_bgr: bool = False):
         if not model_path:
             raise ValueError(
                 "YoloInspector 需要真实模型路径；模型未到位请用 SimInspector")
         from utils.camera_detect.yolo_load import YoloLoad  # 延迟导入
 
         self._robot = robot
-        self._yolo = YoloLoad(model_path=model_path, confidence=confidence,
+        # 推理阈值取所有判定阈值的最低档，避免低阈值目标在模型侧被丢弃；
+        # 逐类过滤在判定阶段按 conf_by_class 执行（对齐队友双阈值语义：
+        # smoking 0.25 / 其他 0.65）。conf_by_class 缺省时行为与原来一致。
+        self._class_conf = dict(conf_by_class) if conf_by_class else None
+        if self._class_conf:
+            infer_conf = min(list(self._class_conf.values()) + [min_conf])
+        else:
+            infer_conf = confidence
+        self._yolo = YoloLoad(model_path=model_path, confidence=infer_conf,
                               auto_load=True)  # 文件不存在时 validate 抛错
         self._expect = tuple(expect_classes)
         self._abnormal = tuple(abnormal_classes)
@@ -118,6 +128,9 @@ class YoloInspector(InspectorBase):
         self._frame_timeout = frame_timeout
         self._inference_timeout = float(inference_timeout)
         self._min_conf = min_conf
+        # robot_controller 出图为 RGB 序，ultralytics 对 numpy 输入按 BGR
+        # 处理且队友模型按 BGR 帧训练；to_bgr=True 时在喂模型前翻转通道。
+        self._to_bgr = bool(to_bgr)
         # 推理软超时后置为 True：不再信任该实例，后续直接返回 ERROR
         self._poisoned = False
 
@@ -175,6 +188,9 @@ class YoloInspector(InspectorBase):
             return PoiInspection(
                 status=InspectionStatus.NO_FRAME, poi=poi_name,
                 detail="camera_get_rgb_depth 返回无 rgb")
+        if self._to_bgr:
+            import numpy as np
+            rgb = np.ascontiguousarray(rgb[..., ::-1])  # RGB -> BGR
 
         # 2) 推理：软超时包装
         outcome, payload = self._detect_with_timeout(rgb)
@@ -203,7 +219,13 @@ class YoloInspector(InspectorBase):
                 simulated=False,
             ))
 
-        strong = [d for d in detections if d.confidence >= self._min_conf]
+        if self._class_conf:
+            # 按类阈值过滤：未列出的类别回退到 min_conf
+            strong = [d for d in detections
+                      if d.confidence >= self._class_conf.get(d.class_name,
+                                                              self._min_conf)]
+        else:
+            strong = [d for d in detections if d.confidence >= self._min_conf]
         hit_abnormal = [d for d in strong if d.class_name in self._abnormal]
         if hit_abnormal:
             return PoiInspection(
