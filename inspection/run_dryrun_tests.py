@@ -17,7 +17,7 @@ from inspection.controller import InspectionConfig, InspectionController, State
 from inspection.recorder import InspectionRecorder
 from inspection.inspector import SimInspector, YoloInspector
 from inspection.navigator import ChassisNavigator, SimNavigator
-from inspection.speaker import SimSpeaker
+from inspection.speaker import SimSpeaker, TtsSpeaker, SETTLE_S
 from inspection.types import (
     InspectionStatus,
     NavOutcome,
@@ -624,7 +624,8 @@ class _MockYoloInspector(YoloInspector):
 
     def __init__(self, frame=None, frame_exc=None, detect_fn=None,
                  inference_timeout=0.2, frame_timeout=0.2,
-                 expect=("fire_extinguisher",), abnormal=("smoking",)):
+                 expect=("fire_extinguisher",), abnormal=("smoking",),
+                 conf_by_class=None, to_bgr=False, min_conf=0.5):
         self._robot = _FakeCameraRobot(frame=frame, exc=frame_exc)
         self._yolo = _FakeYolo(detect_fn or (lambda rgb: {
             "detections": [], "inference_ms": 1.0}))
@@ -633,7 +634,9 @@ class _MockYoloInspector(YoloInspector):
         self._camera_name = "head"
         self._frame_timeout = frame_timeout
         self._inference_timeout = inference_timeout
-        self._min_conf = 0.5
+        self._min_conf = min_conf
+        self._class_conf = dict(conf_by_class) if conf_by_class else None
+        self._to_bgr = to_bgr
         self._poisoned = False
 
 
@@ -750,6 +753,535 @@ def test_vis_timeout_controller_policy():
            all(s == "error" for s in statuses[1:]), str(statuses))
 
 
+# ── TTS 语义与完成判定：纯 Mock 测试（不连 ROS / 不发声 / 不真实等待） ─────
+
+import inspection.speaker as _spk_mod
+
+
+class _FakeResp:
+    """模拟 interaction_msgs/srv/TtsService.Response。"""
+
+    def __init__(self, success=True, status=""):
+        self.success = success
+        self.status = status
+
+
+class _ScriptedCall:
+    """按脚本顺序返回 (ok, resp)，超出脚本走默认值。记录调用 (cmd, text)。"""
+
+    def __init__(self, script):
+        # script 元素：(ok, resp) 或 callable(cmd,text)->(ok,resp)
+        self.script = list(script)
+        self.idx = 0
+        self.log = []  # (cmd, text)
+
+    def __call__(self, text, cmd):
+        self.log.append((cmd, text))
+        if self.idx < len(self.script):
+            entry = self.script[self.idx]
+            self.idx += 1
+            if callable(entry):
+                return entry(cmd, text)
+            return entry
+        # 默认：append 成功；query 返回 idle
+        if cmd == "query":
+            return True, _FakeResp(True, "idle")
+        return True, _FakeResp(True, "success")
+
+
+class _Clock:
+    """可控时钟：monotonic 每次调用前进 step，sleep 空转。"""
+
+    def __init__(self, step=0.5):
+        self.t = 0.0
+        self.step = step
+
+    def monotonic(self):
+        t = self.t
+        self.t += self.step
+        return t
+
+    def sleep(self, _s):
+        pass
+
+
+def _make_tts_for_test(script, done_timeout_s=30.0, clock_step=0.5):
+    """绕过真实 __init__（不连服务），注入脚本化 _call 与可控时钟。"""
+    spk = TtsSpeaker.__new__(TtsSpeaker)
+    spk._audio_id = "audio_guide"
+    spk._done_timeout_s = done_timeout_s
+    caller = _ScriptedCall(script)
+    spk._call = caller
+    clock = _Clock(step=clock_step)
+    fake_time = _pytypes.SimpleNamespace(
+        monotonic=clock.monotonic, sleep=clock.sleep)
+    orig_time = _spk_mod.time
+    _spk_mod.time = fake_time
+    return spk, caller, lambda: setattr(_spk_mod, "time", orig_time)
+
+
+def _ok(status="success"):
+    return True, _FakeResp(True, status)
+
+
+def _query(status):
+    return True, _FakeResp(True, status)
+
+
+def test_tts_interrupt_calls_stop_then_append():
+    # interrupt=True：必须 stop(空text) → append(目标文本)，两步
+    spk, caller, restore = _make_tts_for_test([
+        _ok(),            # stop
+        _ok(),            # append
+        _query("playing"),
+        _query("idle"),
+        _query("idle"),
+    ])
+    try:
+        r = spk.say("测试文本", interrupt=True)
+    finally:
+        restore()
+    _check("tts.interrupt.stop_first",
+           caller.log[0] == ("stop", ""), str(caller.log))
+    _check("tts.interrupt.append_second",
+           caller.log[1] == ("append", "测试文本"), str(caller.log))
+    _check("tts.interrupt.done", r.state is SpeechState.DONE_OBSERVED,
+           r.state.value)
+    _check("tts.interrupt.no_stop_with_text",
+           all(not (c == "stop" and t) for c, t in caller.log), str(caller.log))
+
+
+def test_tts_no_interrupt_only_append():
+    # interrupt=False：只调用 append，不得出现 stop
+    spk, caller, restore = _make_tts_for_test([
+        _ok(),            # append
+        _query("playing"),
+        _query("idle"),
+        _query("idle"),
+    ])
+    try:
+        r = spk.say("测试文本", interrupt=False)
+    finally:
+        restore()
+    cmds = [c for c, _ in caller.log]
+    _check("tts.noint.first_append", cmds[0] == "append", str(cmds))
+    _check("tts.noint.no_stop", "stop" not in cmds, str(cmds))
+    _check("tts.noint.done", r.state is SpeechState.DONE_OBSERVED,
+           r.state.value)
+
+
+def test_tts_bounce_no_premature_done():
+    # idle → playing → idle → playing：中间空窗未稳定，不得判定 DONE
+    spk, caller, restore = _make_tts_for_test([
+        _ok(), _ok(),                    # stop, append
+        _query("idle"), _query("playing"),
+        _query("idle"), _query("playing"),
+        _query("playing"), _query("playing"),
+        _query("playing"), _query("playing"),
+    ], done_timeout_s=2.5, clock_step=0.5)
+    try:
+        r = spk.say("短", interrupt=True)
+    finally:
+        restore()
+    _check("tts.bounce.not_done",
+           r.state is not SpeechState.DONE_OBSERVED, r.state.value)
+    _check("tts.bounce.timeout",
+           r.state is SpeechState.QUERY_TIMEOUT, r.state.value)
+
+
+def test_tts_settle_before_done():
+    # playing 后短暂非播放，再连续稳定非播放：达到 SETTLE_S 才 DONE
+    spk, caller, restore = _make_tts_for_test([
+        _ok(),                           # append
+        _query("playing"),
+        _query("idle"),                  # 首次 idle，未达 SETTLE
+        _query("idle"),                  # 连续 idle，now-idle>=SETTLE → DONE
+    ], clock_step=0.5)  # 0.5 > SETTLE_S(0.4)
+    try:
+        r = spk.say("短", interrupt=False)
+    finally:
+        restore()
+    _check("tts.settle.done", r.state is SpeechState.DONE_OBSERVED,
+           r.state.value)
+    _check("tts.settle.observed", r.observed_transition is True)
+
+
+def test_tts_settle_not_reached_no_done():
+    # playing 后只有一次 idle（未达 SETTLE_S），不得 DONE
+    spk, caller, restore = _make_tts_for_test([
+        _ok(),                           # append
+        _query("playing"),
+        _query("idle"),                  # 仅一帧 idle，不满足连续稳定
+        _query("idle"),
+    ], done_timeout_s=1.0, clock_step=0.2)  # 0.2 < SETTLE_S(0.4)
+    try:
+        r = spk.say("短", interrupt=False)
+    finally:
+        restore()
+    _check("tts.nosettle.not_done",
+           r.state is not SpeechState.DONE_OBSERVED, r.state.value)
+
+
+def test_tts_never_playing_not_faked_done():
+    # 始终未观测到 playing：只能 SUBMIT_UNCONFIRMED，不得伪造 DONE_OBSERVED
+    spk, caller, restore = _make_tts_for_test([
+        _ok(),                           # append
+        _query("idle"), _query("idle"), _query("idle"),
+        _query("idle"), _query("idle"), _query("idle"),
+    ], clock_step=0.5)
+    try:
+        r = spk.say("测试", interrupt=False)  # est=max(1.5, 2*0.22)=1.5, +1.0=2.5
+    finally:
+        restore()
+    _check("tts.never.state",
+           r.state is SpeechState.SUBMIT_UNCONFIRMED, r.state.value)
+    _check("tts.never.not_done",
+           r.state is not SpeechState.DONE_OBSERVED, r.state.value)
+    _check("tts.never.not_observed", r.observed_transition is False)
+
+
+def test_tts_append_call_exception():
+    spk, caller, restore = _make_tts_for_test([
+        (False, RuntimeError("network down")),  # append 调用异常
+    ])
+    try:
+        r = spk.say("测试", interrupt=False)
+    finally:
+        restore()
+    _check("tts.append_exc.state",
+           r.state is SpeechState.SUBMIT_FAILED, r.state.value)
+    _check("tts.append_exc.not_success", r.submit_success is False)
+
+
+def test_tts_append_success_false():
+    spk, caller, restore = _make_tts_for_test([
+        (True, _FakeResp(False, "rejected")),  # success=false
+    ])
+    try:
+        r = spk.say("测试", interrupt=False)
+    finally:
+        restore()
+    _check("tts.reject.state",
+           r.state is SpeechState.SUBMIT_FAILED, r.state.value)
+    _check("tts.reject.status", r.submit_status == "rejected",
+           r.submit_status)
+
+
+def test_tts_query_error():
+    # append 成功，但 query 调用失败 → QUERY_ERROR
+    spk, caller, restore = _make_tts_for_test([
+        _ok(),
+        (False, RuntimeError("query rpc failed")),
+    ])
+    try:
+        r = spk.say("测试", interrupt=False)
+    finally:
+        restore()
+    _check("tts.query_err.state",
+           r.state is SpeechState.QUERY_ERROR, r.state.value)
+
+
+def test_tts_always_playing_hard_timeout():
+    # 一直 playing，直到硬超时 → QUERY_TIMEOUT
+    spk, caller, restore = _make_tts_for_test([
+        _ok(),
+        _query("playing"), _query("playing"), _query("playing"),
+        _query("playing"), _query("playing"),
+    ], done_timeout_s=1.5, clock_step=0.5)
+    try:
+        r = spk.say("测试", interrupt=False)
+    finally:
+        restore()
+    _check("tts.always_playing.state",
+           r.state is SpeechState.QUERY_TIMEOUT, r.state.value)
+    _check("tts.always_playing.observed", r.observed_transition is True)
+
+
+def test_tts_stop_failure_still_appends():
+    # stop 失败（best-effort）不阻塞 append，仍能正常播报完成
+    spk, caller, restore = _make_tts_for_test([
+        (False, RuntimeError("stop rpc failed")),  # stop 失败
+        _ok(),                                      # append 成功
+        _query("playing"), _query("idle"), _query("idle"),
+    ])
+    try:
+        r = spk.say("测试", interrupt=True)
+    finally:
+        restore()
+    _check("tts.stop_fail.done",
+           r.state is SpeechState.DONE_OBSERVED, r.state.value)
+    _check("tts.stop_fail.append_called",
+           ("append", "测试") in caller.log, str(caller.log))
+
+
+def test_tts_exact_playing_match():
+    # 精确匹配：status="PLAYING" 或 "not_playing" 不算在播
+    spk, caller, restore = _make_tts_for_test([
+        _ok(),
+        _query("PLAYING"),      # 大小写不同，不算 playing
+        _query("not_playing"),  # 含子串但不精确，不算 playing
+        _query("playing"),
+        _query("idle"), _query("idle"),
+    ], clock_step=0.5)
+    try:
+        r = spk.say("测试", interrupt=False)
+    finally:
+        restore()
+    _check("tts.exact.done", r.state is SpeechState.DONE_OBSERVED,
+           r.state.value)
+
+
+# ── 文案映射层 report.py：纯离线 ──────────────────────────────────
+
+def test_report_texts():
+    from inspection.report import build_speech_text
+    from inspection.types import Detection, PoiInspection
+
+    def det(name, conf):
+        return Detection(class_name=name, confidence=conf,
+                         xyxy=[0, 0, 5, 5])
+
+    expect = ("safety_sign", "fire_extinguisher")
+    abnormal = ("smoking",)
+
+    # SUCCESS：引用实际达标检出，含"在位"，不含"火灾"
+    r = PoiInspection(status=InspectionStatus.SUCCESS, poi="P1",
+                      detections=[det("safety_sign", 0.9),
+                                  det("fire_extinguisher", 0.9)])
+    t = build_speech_text("P1", r, expect_classes=expect,
+                          abnormal_classes=abnormal, min_conf=0.65)
+    _check("report.success_items",
+           "灭火器" in t and "安全指示牌" in t and "未发现异常" in t, t)
+    _check("report.success_no_fire_word", "火灾" not in t, t)
+
+    # ABNORMAL(smoking)：只播"吸烟行为"，绝不播"火灾"
+    r = PoiInspection(status=InspectionStatus.ABNORMAL, poi="P2",
+                      detections=[det("smoking", 0.9)])
+    t = build_speech_text("P2", r, expect_classes=expect,
+                          abnormal_classes=abnormal, min_conf=0.65,
+                          conf_by_class={"smoking": 0.25})
+    _check("report.abnormal_smoking",
+           "警告" in t and "吸烟行为" in t and "火灾" not in t, t)
+
+    # ABNORMAL 但达标检出里没有异常类（口径不一致）：兜底泛化文案，不编造类别
+    r = PoiInspection(status=InspectionStatus.ABNORMAL, poi="P3",
+                      detections=[det("smoking", 0.1)])
+    t = build_speech_text("P3", r, expect_classes=expect,
+                          abnormal_classes=abnormal, min_conf=0.65,
+                          conf_by_class={"smoking": 0.25})
+    _check("report.abnormal_no_fabrication",
+           "异常" in t and "吸烟" not in t and "火灾" not in t, t)
+
+    # UNCERTAIN：点名未能确认的期望目标
+    r = PoiInspection(status=InspectionStatus.UNCERTAIN, poi="P4",
+                      detections=[det("fire_extinguisher", 0.3)])
+    t = build_speech_text("P4", r, expect_classes=expect,
+                          abnormal_classes=abnormal, min_conf=0.65)
+    _check("report.uncertain_missing",
+           "不确定" in t and "安全指示牌" in t and "人工复核" in t, t)
+
+    # 一切非正常态：不出现"正常/未发现异常"，且引导人工
+    for st in (InspectionStatus.UNCERTAIN, InspectionStatus.TIMEOUT,
+               InspectionStatus.NO_FRAME, InspectionStatus.NO_MODEL,
+               InspectionStatus.ERROR):
+        t = build_speech_text("P5", PoiInspection(status=st, poi="P5"),
+                              expect_classes=expect,
+                              abnormal_classes=abnormal)
+        _check(f"report.{st.value}_not_normal",
+               "未发现异常" not in t and "检查完成，" not in t
+               and ("人工" in t), t)
+
+
+def test_vis_conf_by_class():
+    # 按类阈值：smoking 0.3 在双阈值(smoking=0.25)下应判异常
+    def det(name, conf):
+        return {"class_name": name, "confidence": conf,
+                "xyxy": [0, 0, 5, 5]}
+
+    ins = _MockYoloInspector(
+        frame=_FAKE_FRAME, conf_by_class={"smoking": 0.25}, min_conf=0.65,
+        detect_fn=lambda rgb: {"detections": [det("smoking", 0.3)],
+                               "inference_ms": 1.0})
+    r = ins.inspect("P")
+    _check("vis.per_class_smoking_abnormal",
+           r.status is InspectionStatus.ABNORMAL, r.status.value)
+
+    # 其他类 0.55 在 min_conf=0.65 下不达标 → UNCERTAIN（不是 SUCCESS）
+    ins2 = _MockYoloInspector(
+        frame=_FAKE_FRAME, conf_by_class={"smoking": 0.25}, min_conf=0.65,
+        detect_fn=lambda rgb: {"detections": [det("fire_extinguisher", 0.55)],
+                               "inference_ms": 1.0})
+    r2 = ins2.inspect("P")
+    _check("vis.per_class_other_stricter",
+           r2.status is InspectionStatus.UNCERTAIN, r2.status.value)
+
+    # 缺省（无 conf_by_class）：0.55 ≥ 0.5 维持原行为 → SUCCESS
+    ins3 = _MockYoloInspector(
+        frame=_FAKE_FRAME,
+        detect_fn=lambda rgb: {"detections": [det("fire_extinguisher", 0.55)],
+                               "inference_ms": 1.0})
+    r3 = ins3.inspect("P")
+    _check("vis.default_threshold_unchanged",
+           r3.status is InspectionStatus.SUCCESS, r3.status.value)
+
+
+def test_vis_to_bgr():
+    # to_bgr=True：喂给模型的帧应是 RGB→BGR 翻转后的连续数组
+    import numpy as np
+
+    rgb = np.zeros((2, 3, 3), dtype=np.uint8)
+    rgb[..., 0] = 200  # R 通道标记
+    rgb[..., 2] = 7
+    captured = {}
+
+    def detect_fn(frame):
+        captured["frame"] = frame
+        return {"detections": [], "inference_ms": 1.0}
+
+    ins = _MockYoloInspector(frame={"rgb": rgb}, detect_fn=detect_fn,
+                             to_bgr=True)
+    ins.inspect("P")
+    fed = captured["frame"]
+    # 原帧 R=200/G=0/B=7 → 翻转后 fed[...,0]=7（原B）, fed[...,2]=200（原R）
+    _check("vis.to_bgr_flip_exact",
+           int(fed[0, 0, 0]) == 7 and int(fed[0, 0, 2]) == 200
+           and int(fed[0, 0, 1]) == 0 and fed.flags["C_CONTIGUOUS"],
+           f"fed[0,0]={fed[0, 0].tolist()}")
+
+    # to_bgr=False（默认）：帧对象原样传递
+    captured2 = {}
+    ins2 = _MockYoloInspector(frame={"rgb": rgb}, detect_fn=lambda f: (
+        captured2.setdefault("frame", f),
+        {"detections": [], "inference_ms": 1.0})[1])
+    ins2.inspect("P")
+    _check("vis.to_bgr_off_passthrough", captured2["frame"] is rgb)
+
+
+# ── 手动单点闭环 run_manual_inspection：纯离线 ─────────────────────
+
+def _load_manual_mod():
+    src = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    path = os.path.join(src, "chassis", "run_manual_inspection.py")
+    spec = importlib.util.spec_from_file_location("run_manual_mod", path)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+class _ManualArgs:
+    expect = ["safety_sign", "fire_extinguisher"]
+    abnormal = ["smoking"]
+    conf_smoking = 0.25
+    conf_other = 0.65
+
+
+def _run_manual(inputs, scenario="normal"):
+    mod = _load_manual_mod()
+    vision, spk = mod._build_sim(_FakeManualScenario(scenario))
+    record_path = os.path.join(tempfile.mkdtemp(prefix="manual_test_"),
+                               f"{scenario}.jsonl")
+    rec = InspectionRecorder(record_path, meta={"mode": "test",
+                                                "simulated": True})
+    it = iter(inputs)
+
+    def input_fn(_prompt):
+        v = next(it)
+        if isinstance(v, BaseException):
+            raise v
+        return v
+
+    rc = mod.run_loop(vision, spk, rec, _ManualArgs(),
+                      conf_by_class={"smoking": 0.25},
+                      input_fn=input_fn, output_fn=lambda *a, **k: None)
+    with open(record_path, encoding="utf-8") as fp:
+        records = [json.loads(line) for line in fp if line.strip()]
+    return rc, records, spk
+
+
+class _FakeManualScenario:
+    def __init__(self, scenario):
+        self.scenario = scenario
+        self.expect = ["safety_sign", "fire_extinguisher"]
+
+
+def test_manual_loop_basic():
+    rc, records, spk = _run_manual(["货架A", "q"])
+    pois = _poi_records(records)
+    _check("manual.basic_rc0", rc == 0, f"rc={rc}")
+    _check("manual.basic_one_poi", len(pois) == 1, str(len(pois)))
+    p = pois[0]
+    _check("manual.basic_fields",
+           p["poi"] == "货架A" and p["final"] == "done"
+           and p["inspection"]["status"] == "success"
+           and p["speech"]["report"]["state"] == "done_observed",
+           json.dumps(p, ensure_ascii=False)[:200])
+    _check("manual.basic_text_accurate",
+           "灭火器" in p["speech"]["report"]["text"]
+           and "火灾" not in p["speech"]["report"]["text"],
+           p["speech"]["report"]["text"])
+
+
+def test_manual_loop_speech_fail_not_blocking():
+    rc, records, spk = _run_manual(["P1", "P2", "q"], scenario="speech_fail")
+    pois = _poi_records(records)
+    _check("manual.spk_fail_rc0", rc == 0, f"rc={rc}")
+    _check("manual.spk_fail_two_pois", len(pois) == 2, str(len(pois)))
+    _check("manual.spk_fail_vision_kept",
+           all(p["inspection"]["status"] == "success" for p in pois)
+           and all(p["speech"]["report"]["state"] == "submit_failed"
+                   for p in pois)
+           and all(p["final"] == "done" for p in pois),
+           json.dumps([p["speech"]["report"]["state"] for p in pois]))
+
+
+def test_manual_loop_eof_and_interrupt():
+    rc_eof, records_eof, _ = _run_manual([EOFError()])
+    summaries = [r for r in records_eof if r.get("record_type") == "summary"]
+    _check("manual.eof_clean", rc_eof == 0
+           and summaries and summaries[0]["final_state"] == "done",
+           f"rc={rc_eof}")
+
+    rc_ki, records_ki, _ = _run_manual([KeyboardInterrupt()])
+    summaries_ki = [r for r in records_ki
+                    if r.get("record_type") == "summary"]
+    _check("manual.ki_aborted", rc_ki == 1
+           and summaries_ki and summaries_ki[0]["final_state"] == "aborted",
+           f"rc={rc_ki}")
+
+
+def test_manual_gate():
+    mod = _load_manual_mod()
+    env = mod.REAL_CONFIRM_ENV
+    old = _save_env(env)
+    try:
+        _check("manual.gate_eof_reject",
+               mod._confirm_real(_ManualRealArgs(), input_fn=_eof_input)
+               is False)
+        os.environ[env] = "yes"
+        _check("manual.gate_wrong_env_reject",
+               mod._confirm_real(_ManualRealArgs(), input_fn=_eof_input)
+               is False)
+        os.environ.pop(env, None)
+        _check("manual.gate_yes_accept",
+               mod._confirm_real(_ManualRealArgs(),
+                                 input_fn=lambda _p: "YES") is True)
+        os.environ[env] = "1"
+        _check("manual.gate_env_accept",
+               mod._confirm_real(_ManualRealArgs(), input_fn=_eof_input)
+               is True)
+    finally:
+        _restore_env(env, old)
+
+
+class _ManualRealArgs:
+    model = "/nonexistent/best.pt"
+    expect = ["safety_sign"]
+    abnormal = ["smoking"]
+    conf_smoking = 0.25
+    conf_other = 0.65
+    record = "/tmp/manual_mock_never_written.jsonl"
+
+
 def main():
     print("=== dry-run 场景测试 ===")
     test_success()
@@ -786,6 +1318,27 @@ def main():
     test_vis_inference_error()
     test_vis_judgement_logic()
     test_vis_timeout_controller_policy()
+    print("=== TTS 语义与完成判定 Mock 测试 ===")
+    test_tts_interrupt_calls_stop_then_append()
+    test_tts_no_interrupt_only_append()
+    test_tts_bounce_no_premature_done()
+    test_tts_settle_before_done()
+    test_tts_settle_not_reached_no_done()
+    test_tts_never_playing_not_faked_done()
+    test_tts_append_call_exception()
+    test_tts_append_success_false()
+    test_tts_query_error()
+    test_tts_always_playing_hard_timeout()
+    test_tts_stop_failure_still_appends()
+    test_tts_exact_playing_match()
+    print("=== 文案映射与单点闭环 Mock 测试 ===")
+    test_report_texts()
+    test_vis_conf_by_class()
+    test_vis_to_bgr()
+    test_manual_loop_basic()
+    test_manual_loop_speech_fail_not_blocking()
+    test_manual_loop_eof_and_interrupt()
+    test_manual_gate()
     failed = [r for r in _results if r[1] == FAIL]
     print(f"\n=== 结果: {len(_results) - len(failed)}/{len(_results)} 通过 ===")
     return 1 if failed else 0
