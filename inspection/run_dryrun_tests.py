@@ -1031,6 +1031,140 @@ def test_tts_exact_playing_match():
            r.state.value)
 
 
+# ── TTS 结构化日志：纯 Mock，不连真实服务 ─────────────────────────
+
+class _LogCapture:
+    """捕获 inspection.speaker 日志记录（不依赖真实 handler 输出）。"""
+
+    def __init__(self):
+        import logging as _lg
+        self._lg = _lg
+        self.records = []
+        handler = _lg.Handler()
+        handler.emit = self.records.append
+        self._handler = handler
+        logger = _lg.getLogger("inspection.speaker")
+        self._logger = logger
+        self._old_level = logger.level
+        logger.setLevel(_lg.DEBUG)
+        logger.addHandler(handler)
+
+    def messages(self):
+        return [r.getMessage() for r in self.records]
+
+    def close(self):
+        self._logger.removeHandler(self._handler)
+        self._logger.setLevel(self._old_level)
+
+
+def _say_with_logs(script, text="测试文本", interrupt=True, **kw):
+    cap = _LogCapture()
+    spk, caller, restore = _make_tts_for_test(script, **kw)
+    try:
+        r = spk.say(text, interrupt=interrupt)
+    finally:
+        restore()
+    msgs = cap.messages()
+    cap.close()
+    return r, caller, msgs
+
+
+def test_tts_log_done_path():
+    r, caller, msgs = _say_with_logs([
+        _ok(), _ok(),                       # stop, append
+        _query("playing"), _query("idle"), _query("idle"),
+    ])
+    _check("ttslog.done.state", r.state is SpeechState.DONE_OBSERVED,
+           r.state.value)
+    joined = "\n".join(msgs)
+    _check("ttslog.done.start", "start" in joined and "interrupt=True"
+           in joined and "audio_id=audio_guide" in joined, joined)
+    _check("ttslog.done.submit", "submit ok" in joined, joined)
+    _check("ttslog.done.final", "final=done_observed" in joined
+           and "elapsed=" in joined, joined)
+    _check("ttslog.done.stop", "stop ok=" in joined, joined)
+
+
+def test_tts_log_no_full_text():
+    secret = "绝密播报内容XYZ"
+    r, caller, msgs = _say_with_logs([
+        _ok(), _query("playing"), _query("idle"), _query("idle"),
+    ], text=secret, interrupt=False)
+    joined = "\n".join(msgs)
+    _check("ttslog.privacy.no_full_text", secret not in joined, joined)
+    _check("ttslog.privacy.has_ref", f"len={len(secret)}" in joined
+           and "sha1=" in joined, joined)
+
+
+def test_tts_log_distinct_failures():
+    # 四种失败终态：日志 final 标签必须两两可区分
+    # 1) 提交调用异常
+    _, _, m1 = _say_with_logs([(False, RuntimeError("boom"))],
+                              interrupt=False)
+    # 2) 查询异常
+    _, _, m2 = _say_with_logs([
+        _ok(), (False, RuntimeError("query rpc failed"))], interrupt=False)
+    # 3) 查询超时（一直在播，永不稳定）——done_timeout_s 小值加速
+    _, _, m3 = _say_with_logs([
+        _ok(), _query("playing")], done_timeout_s=1.0, clock_step=0.5,
+        interrupt=False)
+    # 4) 提交未确认（从未观测到 playing，估算期结束）——估算期=1.5+1.0s
+    _, _, m4 = _say_with_logs([
+        _ok(), _query("idle")], clock_step=0.5, interrupt=False)
+    j = ["\n".join(m) for m in (m1, m2, m3, m4)]
+    _check("ttslog.fail.submit_failed",
+           "final=submit_failed" in j[0], j[0])
+    _check("ttslog.fail.query_error",
+           "final=query_error" in j[1], j[1])
+    _check("ttslog.fail.query_timeout",
+           "final=query_timeout" in j[2], j[2])
+    _check("ttslog.fail.unconfirmed",
+           "final=submit_unconfirmed" in j[3], j[3])
+    tags = ["submit_failed", "query_error", "query_timeout",
+            "submit_unconfirmed"]
+    _check("ttslog.fail.all_distinct", len(set(tags)) == 4
+           and all(f"final={t}" in jj for t, jj in zip(tags, j)), str(j))
+
+
+def test_tts_log_req_ids_unique():
+    script = [_ok(), _query("playing"), _query("idle"), _query("idle")]
+    _, _, m1 = _say_with_logs(list(script), interrupt=False)
+    _, _, m2 = _say_with_logs(list(script), interrupt=False)
+
+    def _rid(msgs):
+        for m in msgs:
+            if "start" in m:
+                return m.split("]")[0]
+        return ""
+    r1, r2 = _rid(m1), _rid(m2)
+    _check("ttslog.reqid.format", r1.startswith("tts[tts-")
+           or r1.startswith("tts-") or "tts-" in r1, r1)
+    _check("ttslog.reqid.unique", bool(r1) and bool(r2) and r1 != r2,
+           f"{r1} vs {r2}")
+
+
+def test_tts_log_query_raw_recorded():
+    _, _, msgs = _say_with_logs([
+        _ok(), _query("playing"), _query("idle"), _query("idle"),
+    ], interrupt=False)
+    joined = "\n".join(msgs)
+    _check("ttslog.query.raw_playing", "raw='playing'" in joined, joined)
+    _check("ttslog.query.raw_idle", "raw='idle'" in joined, joined)
+
+
+def test_tts_log_interrupt_order_unchanged():
+    # 开启日志捕获后，stop(空text) → append(文本) 调用顺序不变
+    r, caller, msgs = _say_with_logs([
+        _ok(), _ok(), _query("playing"), _query("idle"), _query("idle"),
+    ], interrupt=True)
+    cmds = [c for c, _ in caller.log]
+    _check("ttslog.order.stop_then_append",
+           cmds[0] == "stop" and cmds[1] == "append", str(cmds))
+    _check("ttslog.order.stop_empty_text",
+           caller.log[0][1] == "" and caller.log[1][1] != "",
+           str(caller.log))
+
+
 # ── 文案映射层 report.py：纯离线 ──────────────────────────────────
 
 def test_report_texts():
@@ -1331,6 +1465,13 @@ def main():
     test_tts_always_playing_hard_timeout()
     test_tts_stop_failure_still_appends()
     test_tts_exact_playing_match()
+    print("=== TTS 结构化日志 Mock 测试 ===")
+    test_tts_log_done_path()
+    test_tts_log_no_full_text()
+    test_tts_log_distinct_failures()
+    test_tts_log_req_ids_unique()
+    test_tts_log_query_raw_recorded()
+    test_tts_log_interrupt_order_unchanged()
     print("=== 文案映射与单点闭环 Mock 测试 ===")
     test_report_texts()
     test_vis_conf_by_class()
