@@ -17,7 +17,7 @@ from inspection.controller import InspectionConfig, InspectionController, State
 from inspection.recorder import InspectionRecorder
 from inspection.inspector import SimInspector, YoloInspector
 from inspection.navigator import ChassisNavigator, SimNavigator
-from inspection.speaker import SimSpeaker
+from inspection.speaker import SimSpeaker, TtsSpeaker, SETTLE_S
 from inspection.types import (
     InspectionStatus,
     NavOutcome,
@@ -750,6 +750,284 @@ def test_vis_timeout_controller_policy():
            all(s == "error" for s in statuses[1:]), str(statuses))
 
 
+# ── TTS 语义与完成判定：纯 Mock 测试（不连 ROS / 不发声 / 不真实等待） ─────
+
+import inspection.speaker as _spk_mod
+
+
+class _FakeResp:
+    """模拟 interaction_msgs/srv/TtsService.Response。"""
+
+    def __init__(self, success=True, status=""):
+        self.success = success
+        self.status = status
+
+
+class _ScriptedCall:
+    """按脚本顺序返回 (ok, resp)，超出脚本走默认值。记录调用 (cmd, text)。"""
+
+    def __init__(self, script):
+        # script 元素：(ok, resp) 或 callable(cmd,text)->(ok,resp)
+        self.script = list(script)
+        self.idx = 0
+        self.log = []  # (cmd, text)
+
+    def __call__(self, text, cmd):
+        self.log.append((cmd, text))
+        if self.idx < len(self.script):
+            entry = self.script[self.idx]
+            self.idx += 1
+            if callable(entry):
+                return entry(cmd, text)
+            return entry
+        # 默认：append 成功；query 返回 idle
+        if cmd == "query":
+            return True, _FakeResp(True, "idle")
+        return True, _FakeResp(True, "success")
+
+
+class _Clock:
+    """可控时钟：monotonic 每次调用前进 step，sleep 空转。"""
+
+    def __init__(self, step=0.5):
+        self.t = 0.0
+        self.step = step
+
+    def monotonic(self):
+        t = self.t
+        self.t += self.step
+        return t
+
+    def sleep(self, _s):
+        pass
+
+
+def _make_tts_for_test(script, done_timeout_s=30.0, clock_step=0.5):
+    """绕过真实 __init__（不连服务），注入脚本化 _call 与可控时钟。"""
+    spk = TtsSpeaker.__new__(TtsSpeaker)
+    spk._audio_id = "audio_guide"
+    spk._done_timeout_s = done_timeout_s
+    caller = _ScriptedCall(script)
+    spk._call = caller
+    clock = _Clock(step=clock_step)
+    fake_time = _pytypes.SimpleNamespace(
+        monotonic=clock.monotonic, sleep=clock.sleep)
+    orig_time = _spk_mod.time
+    _spk_mod.time = fake_time
+    return spk, caller, lambda: setattr(_spk_mod, "time", orig_time)
+
+
+def _ok(status="success"):
+    return True, _FakeResp(True, status)
+
+
+def _query(status):
+    return True, _FakeResp(True, status)
+
+
+def test_tts_interrupt_calls_stop_then_append():
+    # interrupt=True：必须 stop(空text) → append(目标文本)，两步
+    spk, caller, restore = _make_tts_for_test([
+        _ok(),            # stop
+        _ok(),            # append
+        _query("playing"),
+        _query("idle"),
+        _query("idle"),
+    ])
+    try:
+        r = spk.say("测试文本", interrupt=True)
+    finally:
+        restore()
+    _check("tts.interrupt.stop_first",
+           caller.log[0] == ("stop", ""), str(caller.log))
+    _check("tts.interrupt.append_second",
+           caller.log[1] == ("append", "测试文本"), str(caller.log))
+    _check("tts.interrupt.done", r.state is SpeechState.DONE_OBSERVED,
+           r.state.value)
+    _check("tts.interrupt.no_stop_with_text",
+           all(not (c == "stop" and t) for c, t in caller.log), str(caller.log))
+
+
+def test_tts_no_interrupt_only_append():
+    # interrupt=False：只调用 append，不得出现 stop
+    spk, caller, restore = _make_tts_for_test([
+        _ok(),            # append
+        _query("playing"),
+        _query("idle"),
+        _query("idle"),
+    ])
+    try:
+        r = spk.say("测试文本", interrupt=False)
+    finally:
+        restore()
+    cmds = [c for c, _ in caller.log]
+    _check("tts.noint.first_append", cmds[0] == "append", str(cmds))
+    _check("tts.noint.no_stop", "stop" not in cmds, str(cmds))
+    _check("tts.noint.done", r.state is SpeechState.DONE_OBSERVED,
+           r.state.value)
+
+
+def test_tts_bounce_no_premature_done():
+    # idle → playing → idle → playing：中间空窗未稳定，不得判定 DONE
+    spk, caller, restore = _make_tts_for_test([
+        _ok(), _ok(),                    # stop, append
+        _query("idle"), _query("playing"),
+        _query("idle"), _query("playing"),
+        _query("playing"), _query("playing"),
+        _query("playing"), _query("playing"),
+    ], done_timeout_s=2.5, clock_step=0.5)
+    try:
+        r = spk.say("短", interrupt=True)
+    finally:
+        restore()
+    _check("tts.bounce.not_done",
+           r.state is not SpeechState.DONE_OBSERVED, r.state.value)
+    _check("tts.bounce.timeout",
+           r.state is SpeechState.QUERY_TIMEOUT, r.state.value)
+
+
+def test_tts_settle_before_done():
+    # playing 后短暂非播放，再连续稳定非播放：达到 SETTLE_S 才 DONE
+    spk, caller, restore = _make_tts_for_test([
+        _ok(),                           # append
+        _query("playing"),
+        _query("idle"),                  # 首次 idle，未达 SETTLE
+        _query("idle"),                  # 连续 idle，now-idle>=SETTLE → DONE
+    ], clock_step=0.5)  # 0.5 > SETTLE_S(0.4)
+    try:
+        r = spk.say("短", interrupt=False)
+    finally:
+        restore()
+    _check("tts.settle.done", r.state is SpeechState.DONE_OBSERVED,
+           r.state.value)
+    _check("tts.settle.observed", r.observed_transition is True)
+
+
+def test_tts_settle_not_reached_no_done():
+    # playing 后只有一次 idle（未达 SETTLE_S），不得 DONE
+    spk, caller, restore = _make_tts_for_test([
+        _ok(),                           # append
+        _query("playing"),
+        _query("idle"),                  # 仅一帧 idle，不满足连续稳定
+        _query("idle"),
+    ], done_timeout_s=1.0, clock_step=0.2)  # 0.2 < SETTLE_S(0.4)
+    try:
+        r = spk.say("短", interrupt=False)
+    finally:
+        restore()
+    _check("tts.nosettle.not_done",
+           r.state is not SpeechState.DONE_OBSERVED, r.state.value)
+
+
+def test_tts_never_playing_not_faked_done():
+    # 始终未观测到 playing：只能 SUBMIT_UNCONFIRMED，不得伪造 DONE_OBSERVED
+    spk, caller, restore = _make_tts_for_test([
+        _ok(),                           # append
+        _query("idle"), _query("idle"), _query("idle"),
+        _query("idle"), _query("idle"), _query("idle"),
+    ], clock_step=0.5)
+    try:
+        r = spk.say("测试", interrupt=False)  # est=max(1.5, 2*0.22)=1.5, +1.0=2.5
+    finally:
+        restore()
+    _check("tts.never.state",
+           r.state is SpeechState.SUBMIT_UNCONFIRMED, r.state.value)
+    _check("tts.never.not_done",
+           r.state is not SpeechState.DONE_OBSERVED, r.state.value)
+    _check("tts.never.not_observed", r.observed_transition is False)
+
+
+def test_tts_append_call_exception():
+    spk, caller, restore = _make_tts_for_test([
+        (False, RuntimeError("network down")),  # append 调用异常
+    ])
+    try:
+        r = spk.say("测试", interrupt=False)
+    finally:
+        restore()
+    _check("tts.append_exc.state",
+           r.state is SpeechState.SUBMIT_FAILED, r.state.value)
+    _check("tts.append_exc.not_success", r.submit_success is False)
+
+
+def test_tts_append_success_false():
+    spk, caller, restore = _make_tts_for_test([
+        (True, _FakeResp(False, "rejected")),  # success=false
+    ])
+    try:
+        r = spk.say("测试", interrupt=False)
+    finally:
+        restore()
+    _check("tts.reject.state",
+           r.state is SpeechState.SUBMIT_FAILED, r.state.value)
+    _check("tts.reject.status", r.submit_status == "rejected",
+           r.submit_status)
+
+
+def test_tts_query_error():
+    # append 成功，但 query 调用失败 → QUERY_ERROR
+    spk, caller, restore = _make_tts_for_test([
+        _ok(),
+        (False, RuntimeError("query rpc failed")),
+    ])
+    try:
+        r = spk.say("测试", interrupt=False)
+    finally:
+        restore()
+    _check("tts.query_err.state",
+           r.state is SpeechState.QUERY_ERROR, r.state.value)
+
+
+def test_tts_always_playing_hard_timeout():
+    # 一直 playing，直到硬超时 → QUERY_TIMEOUT
+    spk, caller, restore = _make_tts_for_test([
+        _ok(),
+        _query("playing"), _query("playing"), _query("playing"),
+        _query("playing"), _query("playing"),
+    ], done_timeout_s=1.5, clock_step=0.5)
+    try:
+        r = spk.say("测试", interrupt=False)
+    finally:
+        restore()
+    _check("tts.always_playing.state",
+           r.state is SpeechState.QUERY_TIMEOUT, r.state.value)
+    _check("tts.always_playing.observed", r.observed_transition is True)
+
+
+def test_tts_stop_failure_still_appends():
+    # stop 失败（best-effort）不阻塞 append，仍能正常播报完成
+    spk, caller, restore = _make_tts_for_test([
+        (False, RuntimeError("stop rpc failed")),  # stop 失败
+        _ok(),                                      # append 成功
+        _query("playing"), _query("idle"), _query("idle"),
+    ])
+    try:
+        r = spk.say("测试", interrupt=True)
+    finally:
+        restore()
+    _check("tts.stop_fail.done",
+           r.state is SpeechState.DONE_OBSERVED, r.state.value)
+    _check("tts.stop_fail.append_called",
+           ("append", "测试") in caller.log, str(caller.log))
+
+
+def test_tts_exact_playing_match():
+    # 精确匹配：status="PLAYING" 或 "not_playing" 不算在播
+    spk, caller, restore = _make_tts_for_test([
+        _ok(),
+        _query("PLAYING"),      # 大小写不同，不算 playing
+        _query("not_playing"),  # 含子串但不精确，不算 playing
+        _query("playing"),
+        _query("idle"), _query("idle"),
+    ], clock_step=0.5)
+    try:
+        r = spk.say("测试", interrupt=False)
+    finally:
+        restore()
+    _check("tts.exact.done", r.state is SpeechState.DONE_OBSERVED,
+           r.state.value)
+
+
 def main():
     print("=== dry-run 场景测试 ===")
     test_success()
@@ -786,6 +1064,19 @@ def main():
     test_vis_inference_error()
     test_vis_judgement_logic()
     test_vis_timeout_controller_policy()
+    print("=== TTS 语义与完成判定 Mock 测试 ===")
+    test_tts_interrupt_calls_stop_then_append()
+    test_tts_no_interrupt_only_append()
+    test_tts_bounce_no_premature_done()
+    test_tts_settle_before_done()
+    test_tts_settle_not_reached_no_done()
+    test_tts_never_playing_not_faked_done()
+    test_tts_append_call_exception()
+    test_tts_append_success_false()
+    test_tts_query_error()
+    test_tts_always_playing_hard_timeout()
+    test_tts_stop_failure_still_appends()
+    test_tts_exact_playing_match()
     failed = [r for r in _results if r[1] == FAIL]
     print(f"\n=== 结果: {len(_results) - len(failed)}/{len(_results)} 通过 ===")
     return 1 if failed else 0

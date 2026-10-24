@@ -4,7 +4,11 @@
     → audio_node → /play_content/tts/play → adaptive_tts。
 
 已核实的字段：Request{text, type, cmd, audio_id, extra} → Response{success, status}。
-已核实的 cmd：stop=打断并播 / append=排队 / query=查询播放状态。
+已核实的 cmd（对齐迎宾 speak_action_server 实测可用实现）：
+    stop=打断当前播报（须带空 text，平台会忽略带 text 的 stop）
+    / append=排队播报（带目标文本）
+    / query=查询播放状态。
+不存在单步"打断并播报"；interrupt=True 时须 stop(空 text) 后 append(文本)。
 
 已知限制（如实声明，不伪造确定性）：
 1. success=true 只表示 audio_node 接受并转发请求（audio_manager 日志
@@ -28,7 +32,11 @@ TTS_SERVICE = "/intelligent_interaction/tts/play"
 DEFAULT_AUDIO_ID = "audio_guide"
 
 QUERY_POLL_S = 0.2
-PLAYING_KEYWORD = "playing"  # 防御式匹配：status 含该子串才认为在播
+PLAYING_STATUS = "playing"          # 精确匹配（不使用子串包含判断）
+SETTLE_S = 0.4                      # 防抖：连续非 playing 的稳定时长（对齐迎宾实现）
+EST_CHAR_RATE = 0.22                # 每字估算秒数（对齐迎宾实现）
+EST_MIN_DUR_S = 1.5                 # 估算最短时长
+EST_GRACE_S = 1.0                   # 估算完成的额外宽容
 
 
 class SpeakerBase:
@@ -127,13 +135,19 @@ class TtsSpeaker(SpeakerBase):
         if not ok:
             return False, False, str(resp)
         status = (getattr(resp, "status", "") or "").strip()
-        return True, PLAYING_KEYWORD in status.lower(), status
+        return True, status == PLAYING_STATUS, status
 
     def say(self, text: str, interrupt: bool = True) -> SpeechResult:
         t0 = time.monotonic()
-        cmd = "stop" if interrupt else "append"
 
-        ok, resp = self._call(text, cmd)
+        # 提交阶段：interrupt=True 须先发 stop(空 text) 打断当前播报，
+        # 再 append(目标文本)。禁止把 stop 与非空 text 组合成单步"打断并播报"，
+        # 平台会忽略带 text 的 stop（返回 success 但不发声）。
+        if interrupt:
+            # best-effort：stop 失败不阻塞 append（对齐迎宾实现）
+            self._call("", "stop")
+
+        ok, resp = self._call(text, "append")
         if not ok:
             return SpeechResult(
                 state=SpeechState.SUBMIT_FAILED, text=text,
@@ -149,28 +163,50 @@ class TtsSpeaker(SpeakerBase):
             )
 
         submit_status = getattr(resp, "status", "")
-        # 提交成功 ≠ 在播。轮询 query 观察 playing→非playing 跳变。
+        # 提交成功 ≠ 在播。轮询 query，必须先观测到 playing，再连续稳定非 playing
+        # （SETTLE_S 防抖）才判定 DONE_OBSERVED。
         saw_playing = False
-        deadline = time.monotonic() + self._done_timeout_s
-        while time.monotonic() < deadline:
+        idle_since = None  # 首次观测到非 playing 的时间戳（用于防抖）
+        est_dur = max(EST_MIN_DUR_S, len(text) * EST_CHAR_RATE)
+        # 从未观测到 playing 时，按估算时长+宽容提前结束，不等满硬超时。
+        # 注意：估算到期只能返回 SUBMIT_UNCONFIRMED，不得伪造 DONE_OBSERVED。
+        est_deadline = t0 + est_dur + EST_GRACE_S
+        hard_deadline = t0 + self._done_timeout_s
+
+        while time.monotonic() < hard_deadline:
+            now = time.monotonic()
             ok, playing, raw = self._is_playing()
             if not ok:
                 return SpeechResult(
                     state=SpeechState.QUERY_ERROR, text=text,
                     submit_success=True, submit_status=submit_status,
-                    elapsed_s=time.monotonic() - t0,
+                    elapsed_s=now - t0,
                 )
             if playing:
                 saw_playing = True
-            elif saw_playing:
-                return SpeechResult(
-                    state=SpeechState.DONE_OBSERVED, text=text,
-                    submit_success=True, submit_status=submit_status,
-                    observed_transition=True,
-                    elapsed_s=time.monotonic() - t0,
-                )
+                idle_since = None
+            else:
+                if saw_playing:
+                    if idle_since is None:
+                        idle_since = now
+                    elif now - idle_since >= SETTLE_S:
+                        return SpeechResult(
+                            state=SpeechState.DONE_OBSERVED, text=text,
+                            submit_success=True, submit_status=submit_status,
+                            observed_transition=True,
+                            elapsed_s=now - t0,
+                        )
+                else:
+                    # 从未观测到 playing：到估算期限则放弃等待（不伪造完成）
+                    if now >= est_deadline:
+                        return SpeechResult(
+                            state=SpeechState.SUBMIT_UNCONFIRMED, text=text,
+                            submit_success=True, submit_status=submit_status,
+                            elapsed_s=now - t0,
+                        )
             time.sleep(QUERY_POLL_S)
 
+        # 硬超时
         if saw_playing:
             return SpeechResult(
                 state=SpeechState.QUERY_TIMEOUT, text=text,
@@ -194,7 +230,9 @@ def make_tts_speaker(robot, **kwargs) -> TtsSpeaker:
     def _make_request(text: str, cmd: str):
         req = TtsService.Request()
         req.text = text
-        req.type = "text"
+        # query/stop 等不带文本的请求，type 置空（对齐迎宾实测可用实现）；
+        # 仅 append 携带文本时 type="text"。
+        req.type = "text" if text else ""
         req.cmd = cmd
         req.audio_id = speaker._audio_id
         req.extra = ""
