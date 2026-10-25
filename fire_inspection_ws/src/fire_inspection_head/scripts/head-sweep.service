@@ -1,0 +1,20 @@
+[Unit]
+Description=Fire Inspection Head Sweep (ty2.5)
+After=network-online.target robot-control.service
+Wants=network-online.target
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+User=nvidia
+Group=nvidia
+Environment=HOME=/home/nvidia
+Environment=ROS_LOG_DIR=/home/nvidia/logs/ros
+ExecStart=/bin/bash -c 'source /opt/ros/jazzy/setup.bash && source /home/nvidia/xos/setup.bash && source /home/nvidia/fire-inspection/fire_inspection_ws/install/setup.bash && exec ros2 run fire_inspection_head head_sweep_server --ros-args -p auto_start:=true'
+Restart=on-failure
+RestartSec=5
+KillSignal=SIGINT
+TimeoutStopSec=20
+
+[Install]
+WantedBy=multi-user.target

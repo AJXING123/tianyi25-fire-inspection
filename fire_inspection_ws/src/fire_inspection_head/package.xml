@@ -1,0 +1,27 @@
+<?xml version="1.0"?>
+<?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
+<package format="3">
+  <name>fire_inspection_head</name>
+  <version>0.1.0</version>
+  <description>消防巡检头部控制：六步扫视 + 手柄急停，向 /head/cmd 流式下发 HeadCtrl。</description>
+  <maintainer email="nvidia@example.com">nvidia</maintainer>
+  <license>Apache-2.0</license>
+
+  <depend>rclpy</depend>
+  <depend>std_msgs</depend>
+  <depend>sensor_msgs</depend>
+  <depend>ros2_bridge_msgs</depend>
+  <depend>ament_index_python</depend>
+  <depend>python3-yaml</depend>
+  <depend>launch</depend>
+  <depend>launch_ros</depend>
+
+  <test_depend>ament_copyright</test_depend>
+  <test_depend>ament_flake8</test_depend>
+  <test_depend>ament_pep257</test_depend>
+  <test_depend>python3-pytest</test_depend>
+
+  <export>
+    <build_type>ament_python</build_type>
+  </export>
+</package>
