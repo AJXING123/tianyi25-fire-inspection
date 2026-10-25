@@ -1,0 +1,12 @@
+# goal
+string text
+bool interrupt           # true = 先 stop 空文本打断，再 append 新文本
+---
+# result
+bool success
+string message
+string state             # done | timeout | rejected
+---
+# feedback
+float32 progress         # 0.0 ~ 1.0（按文本时长估算）
+string phase             # submitting | playing | settling

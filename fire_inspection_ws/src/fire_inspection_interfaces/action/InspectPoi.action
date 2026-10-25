@@ -1,0 +1,14 @@
+# goal
+string poi
+string[] expect_classes  # 期望检出类别
+string[] abnormal_classes # 异常类别
+float32 timeout_s
+---
+# result
+uint8 status             # 0 NORMAL / 1 ABNORMAL / 2 UNCERTAIN / 3 TIMEOUT / 4 NO_FRAME / 5 NO_MODEL / 6 ERROR
+bool simulated
+string detail
+string detections_json
+---
+# feedback
+string phase             # capturing | inferring | judging
