@@ -1,0 +1,25 @@
+# 消防巡检视觉配置（机器人端本机直连相机，不走 TCP 中继）
+camera_name: head
+topic: /ob_camera_head/color/image_raw/compressed
+action_name: /fire_inspection/inspect_poi
+
+# 模型权重：留空表示 NO_MODEL，巡检结果不得判为正常
+# 权重不提交 git，机器人上手工放置到 models 目录
+model_path: /home/nvidia/fire-inspection/models/fire_3cls_v2.pt
+
+# 类别阈值：吸烟从宽保证检出，指示牌/灭火器从严压制误检
+thresholds:
+  conf_smoking: 0.25
+  conf_other: 0.65
+
+imgsz: 1280
+device: "0"
+
+timeouts:
+  frame_timeout_s: 3.0
+  inference_timeout_s: 5.0
+
+# 每个点位的检查目标由 orchestrator 在 goal 中下发，此处只给默认值
+defaults:
+  expect_classes: []
+  abnormal_classes: [smoking, fire]
