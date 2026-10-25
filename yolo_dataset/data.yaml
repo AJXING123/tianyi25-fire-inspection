@@ -1,6 +1,0 @@
-train: images/train
-val: images/val
-names:
-  0: smoking
-  1: safety_sign
-  2: fire_extinguisher
