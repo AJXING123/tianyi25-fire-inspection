@@ -31,7 +31,8 @@ if _SRC_DIR not in sys.path:
 _REPO_ROOT = os.path.dirname(_SRC_DIR)
 
 from inspection.recorder import InspectionRecorder
-from inspection.report import build_speech_text
+from inspection.report import (SPEECH_TEXTS, build_speech_text,
+                               parse_poi_focus)
 from inspection.types import PoiRecord, SpeechResult, SpeechState, now_iso
 
 REAL_CONFIRM_ENV = "INSPECTION_REAL_CONFIRM"
@@ -112,7 +113,7 @@ def _build_sim(args):
     return vision, spk
 
 
-def _build_real(args):
+def _build_real(args, poi_focus=None):
     from inspection.inspector import YoloInspector
 
     from robot_controller import robot_controller
@@ -126,7 +127,8 @@ def _build_real(args):
         confidence=args.conf_other, min_conf=args.conf_other,
         conf_by_class=conf_by_class,
         to_bgr=True,  # robot_controller 出图 RGB 序，模型按 BGR 训练
-        camera_name=args.camera)
+        camera_name=args.camera,
+        poi_focus_classes=poi_focus)
     try:
         from inspection.speaker import make_tts_speaker
         spk = make_tts_speaker(robot)
@@ -137,12 +139,32 @@ def _build_real(args):
     return robot, vision, spk, conf_by_class
 
 
+def _speak_stage(spk, rec, stage: str, output_fn) -> SpeechResult:
+    """播报开始/完成固定语句并落盘；失败只记录，不影响巡检主流程。"""
+    text = SPEECH_TEXTS[stage]
+    try:
+        speech = spk.say(text, interrupt=True)
+    except Exception as exc:
+        speech = SpeechResult(state=SpeechState.SUBMIT_FAILED, text=text,
+                              submit_success=False,
+                              submit_status=f"say exception: {exc}")
+    output_fn(f"  {stage} 播报: {speech.state.value}")
+    try:
+        rec.write_raw({"record_type": "speech_stage", "stage": stage,
+                       "ts": now_iso(), "speech": speech.to_dict()})
+    except Exception as exc:
+        output_fn(f"[!!] 写入 {stage} 播报记录失败: {exc}")
+    return speech
+
+
 def run_loop(vision, spk, rec, args, conf_by_class=None, input_fn=input,
-             output_fn=print) -> int:
+             output_fn=print, poi_focus_classes=None) -> int:
     """单点闭环主循环：回车触发检测，q 退出。返回进程退出码。"""
     count = 0
     aborted = False
+    poi_focus = dict(poi_focus_classes or {})
     output_fn("=== 单点巡检就绪：回车=触发检测，q+回车=退出 ===")
+    _speak_stage(spk, rec, "start", output_fn)
     while True:
         try:
             line = input_fn(f"[{count}] 点位名称(回车用默认，q 退出): ")
@@ -167,11 +189,13 @@ def run_loop(vision, spk, rec, args, conf_by_class=None, input_fn=input,
             record.inspection = result.to_dict()
             output_fn(f"  视觉: {result.status.value}  {result.detail}")
 
-            # 2) 生成播报文本（只引用实际达标检出）
+            # 2) 生成播报文本（只引用实际达标检出；专用点位用专用文案）
+            focus = tuple(poi_focus.get(name, ()))
             text = build_speech_text(
                 name, result,
                 expect_classes=args.expect, abnormal_classes=args.abnormal,
-                min_conf=args.conf_other, conf_by_class=conf_by_class)
+                min_conf=args.conf_other, conf_by_class=conf_by_class,
+                focus_classes=focus)
             output_fn(f"  播报: {text}")
 
             # 3) TTS 播报：失败只记录，不影响视觉结论落盘
@@ -208,6 +232,9 @@ def run_loop(vision, spk, rec, args, conf_by_class=None, input_fn=input,
         count += 1
 
     final = "aborted" if aborted else "done"
+    if not aborted:
+        # 正常收尾才播报完成语句；用户中断不播"已完成"
+        _speak_stage(spk, rec, "done", output_fn)
     try:
         rec.write_summary(final, f"manual loop finished, {count} poi(s)")
     except Exception as exc:
@@ -239,21 +266,34 @@ def main() -> int:
     ap.add_argument("--conf-other", type=float, default=0.65,
                     help="其他类别判定阈值（对齐队友实测）")
     ap.add_argument("--camera", default="head", help="实机模式：相机名")
+    ap.add_argument("--poi-focus", action="append", default=[],
+                    metavar="POI=CLASS[,CLASS]",
+                    help="为指定点位配置专用检查目标（如 安全出口=safety_sign），"
+                         "可多次；未配置的点位沿用通用播报，不按名称猜测")
     args = ap.parse_args()
+
+    try:
+        poi_focus = parse_poi_focus(args.poi_focus)
+    except ValueError as exc:
+        print(f"[X] {exc}", flush=True)
+        return 2
+    args.poi_focus_map = poi_focus
 
     if args.real:
         if not _confirm_real(args):
             print("[X] 实机巡检未通过二次确认，已安全退出"
                   "（未连接机器人、未触发任何硬件）。", flush=True)
             return 2
-        robot, vision, spk, conf_by_class = _build_real(args)
+        robot, vision, spk, conf_by_class = _build_real(args, poi_focus)
         rec = InspectionRecorder(args.record, meta={
             "mode": "real_manual", "simulated": False, "model": args.model,
             "expect": list(args.expect), "abnormal": list(args.abnormal),
             "conf_smoking": args.conf_smoking, "conf_other": args.conf_other,
+            "poi_focus": {k: list(v) for k, v in poi_focus.items()},
         })
         try:
-            return run_loop(vision, spk, rec, args, conf_by_class)
+            return run_loop(vision, spk, rec, args, conf_by_class,
+                            poi_focus_classes=poi_focus)
         finally:
             try:
                 robot.stop()
@@ -264,10 +304,12 @@ def main() -> int:
     rec = InspectionRecorder(args.record, meta={
         "mode": "simulate_manual", "scenario": args.scenario,
         "simulated": True,
+        "poi_focus": {k: list(v) for k, v in poi_focus.items()},
     })
     # 模拟模式阈值参数仅用于文案一致性展示
     return run_loop(vision, spk, rec, args,
-                    conf_by_class={"smoking": args.conf_smoking})
+                    conf_by_class={"smoking": args.conf_smoking},
+                    poi_focus_classes=poi_focus)
 
 
 if __name__ == "__main__":

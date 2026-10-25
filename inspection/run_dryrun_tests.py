@@ -625,12 +625,17 @@ class _MockYoloInspector(YoloInspector):
     def __init__(self, frame=None, frame_exc=None, detect_fn=None,
                  inference_timeout=0.2, frame_timeout=0.2,
                  expect=("fire_extinguisher",), abnormal=("smoking",),
-                 conf_by_class=None, to_bgr=False, min_conf=0.5):
+                 conf_by_class=None, to_bgr=False, min_conf=0.5,
+                 absence_abnormal=("fire_extinguisher",),
+                 poi_focus_classes=None):
         self._robot = _FakeCameraRobot(frame=frame, exc=frame_exc)
         self._yolo = _FakeYolo(detect_fn or (lambda rgb: {
             "detections": [], "inference_ms": 1.0}))
         self._expect = tuple(expect)
         self._abnormal = tuple(abnormal)
+        self._absence_abnormal = tuple(absence_abnormal)
+        self._poi_focus = {str(k): tuple(v)
+                           for k, v in (poi_focus_classes or {}).items()}
         self._camera_name = "head"
         self._frame_timeout = frame_timeout
         self._inference_timeout = inference_timeout
@@ -718,17 +723,468 @@ def test_vis_judgement_logic():
     _check("vis.judge_success",
            ins_ok.inspect("P").status is InspectionStatus.SUCCESS)
 
+    # 低置信度灭火器框：不算有效检出 → 按新规则判为 ABNORMAL（不是 SUCCESS）
     ins_unc = _MockYoloInspector(frame=_FAKE_FRAME, detect_fn=lambda rgb: {
         "detections": [det("fire_extinguisher", 0.3)], "inference_ms": 3.0})
     r_unc = ins_unc.inspect("P")
-    _check("vis.judge_uncertain",
-           r_unc.status is InspectionStatus.UNCERTAIN, r_unc.status.value)
+    _check("vis.judge_lowconf_extinguisher_abnormal",
+           r_unc.status is InspectionStatus.ABNORMAL, r_unc.status.value)
 
-    ins_low_abn = _MockYoloInspector(frame=_FAKE_FRAME, detect_fn=lambda rgb: {
+    # 其余期望目标缺失仍是 UNCERTAIN（安全指示牌规则不变）
+    ins_sign = _MockYoloInspector(
+        frame=_FAKE_FRAME, expect=("safety_sign", "fire_extinguisher"),
+        detect_fn=lambda rgb: {
+            "detections": [det("fire_extinguisher", 0.9)],
+            "inference_ms": 3.0})
+    r_sign = ins_sign.inspect("P")
+    _check("vis.judge_uncertain_safety_sign",
+           r_sign.status is InspectionStatus.UNCERTAIN, r_sign.status.value)
+
+    # 低置信度 smoking 不构成异常（expect 置空，隔离灭火器规则以便单独验证）
+    ins_low_abn = _MockYoloInspector(frame=_FAKE_FRAME, expect=(),
+                                     detect_fn=lambda rgb: {
         "detections": [det("smoking", 0.3)], "inference_ms": 3.0})
     r_low = ins_low_abn.inspect("P")
     _check("vis.judge_lowconf_not_abnormal",
-           r_low.status is not InspectionStatus.ABNORMAL, r_low.status.value)
+           r_low.status is InspectionStatus.SUCCESS
+           and "smoking" not in r_low.detail,
+           f"{r_low.status.value} / {r_low.detail}")
+
+
+def test_vis_extinguisher_presence_rule():
+    """灭火器规则：≥1 个有效检出即正常（无数量上限），0 个才异常。"""
+    def det(name, conf, xyxy=None):
+        return {"class_name": name, "confidence": conf,
+                "xyxy": xyxy or [0, 0, 5, 5]}
+
+    def inspect_with(dets, **kw):
+        ins = _MockYoloInspector(
+            frame=_FAKE_FRAME, **kw,
+            detect_fn=lambda rgb: {"detections": dets, "inference_ms": 1.0})
+        return ins.inspect("P")
+
+    # 0 个 → 异常（不是 SUCCESS，也不是"不确定"）
+    r0 = inspect_with([])
+    _check("ext.zero_abnormal",
+           r0.status is InspectionStatus.ABNORMAL, r0.status.value)
+    _check("ext.zero_detail_no_detection", "无检出" in r0.detail, r0.detail)
+
+    # 1 / 2 / 3 / 10 个 → 均正常（无数量上限）
+    for n in (1, 2, 3, 10):
+        dets = [det("fire_extinguisher", 0.9, [i * 10, 0, i * 10 + 5, 5])
+                for i in range(n)]
+        r = inspect_with(dets)
+        _check(f"ext.count_{n}_success",
+               r.status is InspectionStatus.SUCCESS, f"{n}个: {r.status.value}")
+
+    # 重复框（同一目标被重复检出）：按类名集合去重，仍是 SUCCESS
+    dup = [det("fire_extinguisher", 0.9, [0, 0, 5, 5])] * 3
+    rd = inspect_with(dup)
+    _check("ext.duplicate_boxes_success",
+           rd.status is InspectionStatus.SUCCESS, rd.status.value)
+
+    # 仅低于阈值的框 → 不算检出成功 → 异常，且 detail 标明阈值原因
+    rlow = inspect_with([det("fire_extinguisher", 0.3)], min_conf=0.65)
+    _check("ext.lowconf_abnormal",
+           rlow.status is InspectionStatus.ABNORMAL, rlow.status.value)
+    _check("ext.lowconf_detail_mentions_threshold",
+           "低于阈值" in rlow.detail and "0.30" in rlow.detail
+           and "0.65" in rlow.detail, rlow.detail)
+
+    # 混合：1 个有效 + 若干低置信度 → 有效者已满足，判正常
+    rmix = inspect_with([det("fire_extinguisher", 0.9),
+                         det("fire_extinguisher", 0.3)], min_conf=0.65)
+    _check("ext.one_valid_plus_lowconf_success",
+           rmix.status is InspectionStatus.SUCCESS, rmix.status.value)
+
+    # 吸烟规则不变：达标 smoking + 灭火器缺失 → 仍按 smoking 判异常
+    rsmoke = inspect_with([det("smoking", 0.9)])
+    _check("ext.smoking_rule_unchanged",
+           rsmoke.status is InspectionStatus.ABNORMAL
+           and "smoking" in rsmoke.detail, rsmoke.detail)
+
+    # 安全指示牌缺失、灭火器在位 → 仍 UNCERTAIN（其他巡检规则不变）
+    rsign = inspect_with([det("fire_extinguisher", 0.9)],
+                         expect=("safety_sign", "fire_extinguisher"))
+    _check("ext.safety_sign_rule_unchanged",
+           rsign.status is InspectionStatus.UNCERTAIN, rsign.status.value)
+
+
+def test_report_extinguisher_presence_rule():
+    """播报文案：0 个不说"正常"，1/2/3 个均播报在位。"""
+    from inspection.report import SPEECH_TEXTS, build_speech_text
+    from inspection.types import Detection, PoiInspection
+
+    def det(conf, xyxy=None):
+        return Detection(class_name="fire_extinguisher", confidence=conf,
+                         xyxy=xyxy or [0, 0, 5, 5])
+
+    expect = ("fire_extinguisher",)
+
+    # 0 个：必须告警并点名灭火器，绝不能出现"正常/未发现异常"
+    t0 = build_speech_text(
+        "配电间",
+        PoiInspection(status=InspectionStatus.ABNORMAL, poi="配电间"),
+        expect_classes=expect, abnormal_classes=("smoking",), min_conf=0.65)
+    _check("report.ext.zero_warns",
+           t0 == SPEECH_TEXTS["extinguisher_missing"], t0)
+    _check("report.ext.zero_not_normal",
+           "未发现异常" not in t0 and "正常" not in t0
+           and "火灾" not in t0, t0)
+
+    # 1 / 2 / 3 个：均播报固定"灭火器检查正常。"
+    for n in (1, 2, 3):
+        dets = [det(0.9, [i * 10, 0, i * 10 + 5, 5]) for i in range(n)]
+        t = build_speech_text(
+            "配电间",
+            PoiInspection(status=InspectionStatus.SUCCESS, poi="配电间",
+                          detections=dets),
+            expect_classes=expect, abnormal_classes=("smoking",),
+            min_conf=0.65)
+        _check(f"report.ext.count_{n}_normal",
+               t == SPEECH_TEXTS["extinguisher_ok"] and "火灾" not in t,
+               f"{n}个: {t}")
+
+
+def test_fixed_speech_texts():
+    """固定播报文本：内容准确、不含"火灾"、吸烟未检出时不播警告。"""
+    from inspection.report import SPEECH_TEXTS, build_speech_text
+    from inspection.types import Detection, PoiInspection
+
+    expected = {
+        "start": "消防巡检开始，请注意现场安全。",
+        "extinguisher_ok": "灭火器检查正常。",
+        "extinguisher_missing": "警告，未检测到灭火器，请工作人员检查。",
+        "safety_sign_ok": "安全出口指示灯检查正常。",
+        "safety_sign_missing": "警告，未检测到安全出口指示灯，请工作人员检查。",
+        "smoking": "警告，发现吸烟行为，请立即停止吸烟。",
+        "done": "本次消防巡检已完成。",
+    }
+    _check("texts.all_fixed", SPEECH_TEXTS == expected, str(SPEECH_TEXTS))
+    _check("texts.no_fire_word",
+           all("火灾" not in v for v in SPEECH_TEXTS.values()), "")
+
+    def det(name, conf):
+        return Detection(class_name=name, confidence=conf, xyxy=[0, 0, 1, 1])
+
+    # 吸烟未检出 → 正常文本不含吸烟警告
+    r = PoiInspection(status=InspectionStatus.SUCCESS, poi="P",
+                      detections=[det("fire_extinguisher", 0.9)])
+    t = build_speech_text("P", r, expect_classes=("fire_extinguisher",),
+                          abnormal_classes=("smoking",), min_conf=0.65)
+    _check("texts.no_smoking_when_absent",
+           SPEECH_TEXTS["smoking"] not in t and "吸烟" not in t, t)
+
+    # 吸烟 + 灭火器缺失：两条固定警告都播报，绝不含"火灾"
+    r = PoiInspection(status=InspectionStatus.ABNORMAL, poi="P",
+                      detections=[det("smoking", 0.9)])
+    t = build_speech_text("P", r, expect_classes=("fire_extinguisher",),
+                          abnormal_classes=("smoking",), min_conf=0.65,
+                          conf_by_class={"smoking": 0.25})
+    _check("texts.smoking_and_missing_both",
+           SPEECH_TEXTS["smoking"] in t
+           and SPEECH_TEXTS["extinguisher_missing"] in t
+           and "火灾" not in t, t)
+
+
+def test_manual_loop_speech_wiring():
+    """单点入口打通：视觉结论 → 固定文本 → speaker 实际调用。"""
+    from inspection.report import SPEECH_TEXTS
+
+    rc, records, spk = _run_manual(["配电间", "q"])
+    texts = [t for t, _ in spk.calls]
+    _check("manual.wire_rc0", rc == 0, f"rc={rc}")
+    _check("manual.wire_start_first",
+           texts and texts[0] == SPEECH_TEXTS["start"],
+           str(texts[:1]))
+    _check("manual.wire_report_fixed",
+           SPEECH_TEXTS["extinguisher_ok"] in texts, str(texts))
+    _check("manual.wire_done_last",
+           texts and texts[-1] == SPEECH_TEXTS["done"], str(texts[-1:]))
+    _check("manual.wire_no_fire_word",
+           all("火灾" not in t for t in texts), "")
+
+    stages = [r for r in records if r.get("record_type") == "speech_stage"]
+    _check("manual.wire_stage_records",
+           [s["stage"] for s in stages] == ["start", "done"]
+           and all(s["speech"]["state"] == "done_observed" for s in stages),
+           str([(s["stage"], s["speech"]["state"]) for s in stages]))
+
+
+def test_controller_fixed_speech_routing():
+    """自动巡检控制器：按识别结论选固定文本，绝不误报火灾。"""
+    from inspection.report import SPEECH_TEXTS
+
+    def det(name, conf):
+        return {"class_name": name, "confidence": conf, "xyxy": [0, 0, 5, 5]}
+
+    # 1) 0 个灭火器 → 缺失警告；开始/完成使用固定文本
+    vision0 = _MockYoloInspector(
+        frame=_FAKE_FRAME, expect=("fire_extinguisher",),
+        detect_fn=lambda rgb: {"detections": [], "inference_ms": 1.0})
+    _, records, _, spk0, _ = _run("ctl_no_ext", SimNavigator(),
+                                  SimSpeaker(), vision0)
+    texts0 = [p["speech"]["report"]["text"] for p in _poi_records(records)]
+    _check("ctl.no_ext_missing_text",
+           texts0 and all(t == SPEECH_TEXTS["extinguisher_missing"]
+                          for t in texts0), str(texts0))
+    calls0 = [t for t, _ in spk0.calls]
+    _check("ctl.start_fixed", calls0 and calls0[0] == SPEECH_TEXTS["start"],
+           str(calls0[:1]))
+    _check("ctl.done_fixed", calls0 and calls0[-1] == SPEECH_TEXTS["done"],
+           str(calls0[-1:]))
+
+    # 2) 吸烟（灭火器在位）→ 只播吸烟警告，不播"火灾"
+    vision1 = _MockYoloInspector(
+        frame=_FAKE_FRAME, expect=("fire_extinguisher",),
+        detect_fn=lambda rgb: {
+            "detections": [det("smoking", 0.9),
+                           det("fire_extinguisher", 0.9)],
+            "inference_ms": 1.0})
+    _, records, _, spk1, _ = _run("ctl_smoke", SimNavigator(),
+                                  SimSpeaker(), vision1)
+    texts1 = [p["speech"]["report"]["text"] for p in _poi_records(records)]
+    _check("ctl.smoking_text",
+           texts1 and all(t == SPEECH_TEXTS["smoking"] for t in texts1),
+           str(texts1))
+    _check("ctl.smoking_no_fire",
+           all("火灾" not in t for t in texts1), "")
+    calls1 = [t for t, _ in spk1.calls]
+    _check("ctl.smoking_actually_spoken",
+           SPEECH_TEXTS["smoking"] in calls1
+           and all("火灾" not in t for t in calls1), str(calls1))
+
+
+def test_report_safety_sign_texts():
+    """安全出口指示灯专用文案：正常/异常/不确定/取图失败/超时，且不扩散。"""
+    from inspection.report import SPEECH_TEXTS, build_speech_text
+    from inspection.types import Detection, PoiInspection
+
+    def det(conf, xyxy=None):
+        return Detection(class_name="safety_sign", confidence=conf,
+                         xyxy=xyxy or [0, 0, 5, 5])
+
+    def smoke(conf=0.9):
+        return Detection(class_name="smoking", confidence=conf,
+                         xyxy=[0, 0, 5, 5])
+
+    focus = ("safety_sign",)
+    kw = dict(expect_classes=("safety_sign", "fire_extinguisher"),
+              abnormal_classes=("smoking",), min_conf=0.65,
+              conf_by_class={"smoking": 0.25}, focus_classes=focus)
+
+    # 正常：1/2/3 个有效框都播同一固定文本
+    for n in (1, 2, 3):
+        dets = [det(0.9, [i * 10, 0, i * 10 + 5, 5]) for i in range(n)]
+        t = build_speech_text(
+            "安全出口", PoiInspection(status=InspectionStatus.SUCCESS,
+                                     detections=dets), **kw)
+        _check(f"sign.count_{n}_ok",
+               t == SPEECH_TEXTS["safety_sign_ok"], t)
+
+    # 异常：0 个有效检出 / 只有低置信度框 → 缺失固定警告，绝不"正常"
+    for name, dets in (("zero", []), ("lowconf", [det(0.3)])):
+        t = build_speech_text(
+            "安全出口", PoiInspection(status=InspectionStatus.ABNORMAL,
+                                     detections=dets), **kw)
+        _check(f"sign.{name}_missing",
+               t == SPEECH_TEXTS["safety_sign_missing"], t)
+        _check(f"sign.{name}_not_normal",
+               "正常" not in t and "未发现异常" not in t, t)
+
+    # 不确定 / 取图失败 / 推理超时 / 异常：不得使用确定性结论
+    for st in (InspectionStatus.UNCERTAIN, InspectionStatus.NO_FRAME,
+               InspectionStatus.TIMEOUT, InspectionStatus.ERROR):
+        t = build_speech_text(
+            "安全出口", PoiInspection(status=st, poi="安全出口"), **kw)
+        _check(f"sign.{st.value}_needs_manual",
+               "正常" not in t
+               and SPEECH_TEXTS["safety_sign_missing"] not in t
+               and "人工" in t, t)
+
+    # 专用点位吸烟：只播吸烟警告，目标在位时不得误报缺失、也不提灭火器
+    t = build_speech_text(
+        "安全出口", PoiInspection(status=InspectionStatus.ABNORMAL,
+                                 detections=[det(0.9), smoke()]), **kw)
+    _check("sign.smoking_only_when_present",
+           t == SPEECH_TEXTS["smoking"]
+           and "灭火器" not in t and "安全出口指示灯" not in t, t)
+
+    # 吸烟 + 指示灯缺失：两条警告合并，仍不得提灭火器（专用点只看本点目标）
+    t = build_speech_text(
+        "安全出口", PoiInspection(status=InspectionStatus.ABNORMAL,
+                                 detections=[smoke()]), **kw)
+    _check("sign.smoking_and_missing",
+           SPEECH_TEXTS["smoking"] in t
+           and SPEECH_TEXTS["safety_sign_missing"] in t
+           and "灭火器" not in t and "火灾" not in t, t)
+
+    # 非专用点位：正常结果含 safety_sign 也绝不能播专用正常结论
+    t = build_speech_text(
+        "货架", PoiInspection(status=InspectionStatus.SUCCESS,
+                             detections=[det(0.9)]),
+        expect_classes=("safety_sign",), abnormal_classes=("smoking",),
+        min_conf=0.65)
+    _check("sign.no_focus_not_special",
+           t != SPEECH_TEXTS["safety_sign_ok"]
+           and "安全出口指示灯检查正常" not in t, t)
+
+
+def test_poi_focus_parse():
+    """专用点位映射只做显式解析，格式错误直接拒绝。"""
+    from inspection.report import parse_poi_focus
+
+    m = parse_poi_focus(["安全出口=safety_sign", "P2=safety_sign,fire_extinguisher",
+                         "  ", "P3 = safety_sign"])
+    _check("focus.parse_values",
+           m == {"安全出口": ("safety_sign",),
+                 "P2": ("safety_sign", "fire_extinguisher"),
+                 "P3": ("safety_sign",)}, str(m))
+    _check("focus.parse_empty", parse_poi_focus([]) == {}, "")
+    for bad in ("安全出口", "=safety_sign", "P4="):
+        try:
+            parse_poi_focus([bad])
+            rejected = False
+        except ValueError:
+            rejected = True
+        _check(f"focus.parse_reject[{bad}]", rejected)
+
+
+def test_vis_safety_sign_focus_rule():
+    """专用点位判定：只看本点目标；未配置的点位行为不变。"""
+
+    def det(name, conf, xyxy=None):
+        return {"class_name": name, "confidence": conf,
+                "xyxy": xyxy or [0, 0, 5, 5]}
+
+    def make(dets, poi_focus=None, **kw):
+        return _MockYoloInspector(
+            frame=_FAKE_FRAME, expect=("fire_extinguisher",),
+            min_conf=0.65, poi_focus_classes=poi_focus or {
+                "SIGN": ("safety_sign",)},
+            detect_fn=lambda rgb: {"detections": dets, "inference_ms": 1.0},
+            **kw)
+
+    r = make([det("safety_sign", 0.9)]).inspect("SIGN")
+    _check("vis.sign_focus_present_success",
+           r.status is InspectionStatus.SUCCESS, r.status.value)
+    r = make([det("safety_sign", 0.9), det("safety_sign", 0.9)]).inspect("SIGN")
+    _check("vis.sign_focus_duplicate_success",
+           r.status is InspectionStatus.SUCCESS, r.status.value)
+    r = make([]).inspect("SIGN")
+    _check("vis.sign_focus_absent_abnormal",
+           r.status is InspectionStatus.ABNORMAL
+           and "未检出有效目标" in r.detail and "无检出" in r.detail,
+           f"{r.status.value} {r.detail}")
+    r = make([det("safety_sign", 0.3)]).inspect("SIGN")
+    _check("vis.sign_focus_lowconf_abnormal",
+           r.status is InspectionStatus.ABNORMAL and "低于阈值" in r.detail,
+           f"{r.status.value} {r.detail}")
+    r = make([det("safety_sign", 0.9), det("safety_sign", 0.3)]).inspect("SIGN")
+    _check("vis.sign_focus_one_valid_success",
+           r.status is InspectionStatus.SUCCESS, r.status.value)
+    r = make([det("safety_sign", 0.9), det("smoking", 0.9)]).inspect("SIGN")
+    _check("vis.sign_focus_smoking_abnormal",
+           r.status is InspectionStatus.ABNORMAL
+           and "smoking" in r.detail, f"{r.status.value} {r.detail}")
+
+    # 全局 expect 只在非专用点位生效：缺失 safety_sign → UNCERTAIN（原规则）
+    ins_other = _MockYoloInspector(
+        frame=_FAKE_FRAME, expect=("safety_sign",),
+        min_conf=0.65, poi_focus_classes={"SIGN": ("safety_sign",)},
+        detect_fn=lambda rgb: {"detections": [], "inference_ms": 1.0})
+    r = ins_other.inspect("OTHER")
+    _check("vis.sign_non_focus_uncertain_unchanged",
+           r.status is InspectionStatus.UNCERTAIN, r.status.value)
+    # 非专用点位仍保留灭火器缺失 → ABNORMAL 的原规则
+    ins_ext = _MockYoloInspector(
+        frame=_FAKE_FRAME, expect=("safety_sign", "fire_extinguisher"),
+        min_conf=0.65,
+        detect_fn=lambda rgb: {"detections": [det("safety_sign", 0.9)],
+                               "inference_ms": 1.0})
+    r = ins_ext.inspect("OTHER")
+    _check("vis.ext_rule_unchanged_at_other_poi",
+           r.status is InspectionStatus.ABNORMAL
+           and "fire_extinguisher" in r.detail, r.detail)
+
+    # 取图失败 / 推理超时：专用点位也不能被当成正常或缺失结论
+    r = make([], frame_exc=TimeoutError("timeout")).inspect("SIGN")
+    _check("vis.sign_focus_camera_timeout",
+           r.status is InspectionStatus.NO_FRAME, r.status.value)
+    r = make(
+        [], inference_timeout=0.1,
+        detect_fn=lambda rgb: (time.sleep(0.4), {
+            "detections": [det("safety_sign", 0.9)],
+            "inference_ms": 400.0})[1]).inspect("SIGN")
+    _check("vis.sign_focus_inference_timeout",
+           r.status is InspectionStatus.TIMEOUT, r.status.value)
+
+
+def test_controller_safety_sign_focus_speech():
+    """控制器：专用点位播专用文本，其他点位不播专用文本。"""
+    from inspection.report import SPEECH_TEXTS
+
+    def det(name, conf):
+        return {"class_name": name, "confidence": conf, "xyxy": [0, 0, 5, 5]}
+
+    cfg = InspectionConfig(pois=("SIGN_PT", "OTHER_PT"), dwell_seconds=0.02,
+                           poi_focus_classes={"SIGN_PT": ("safety_sign",)})
+    vision = _MockYoloInspector(
+        frame=_FAKE_FRAME, expect=("fire_extinguisher",), min_conf=0.65,
+        poi_focus_classes={"SIGN_PT": ("safety_sign",)},
+        detect_fn=lambda rgb: {
+            "detections": [det("safety_sign", 0.9),
+                           det("fire_extinguisher", 0.9)],
+            "inference_ms": 1.0})
+    _, records, _, spk, _ = _run("ctl_sign", SimNavigator(), SimSpeaker(),
+                                 vision, cfg)
+    by_poi = {p["poi"]: p["speech"]["report"]["text"]
+              for p in _poi_records(records)}
+    _check("ctl.sign_poi_ok_text",
+           by_poi.get("SIGN_PT") == SPEECH_TEXTS["safety_sign_ok"],
+           str(by_poi))
+    _check("ctl.other_poi_no_sign_text",
+           by_poi.get("OTHER_PT") != SPEECH_TEXTS["safety_sign_ok"]
+           and by_poi.get("OTHER_PT") == SPEECH_TEXTS["extinguisher_ok"],
+           str(by_poi))
+    calls = [t for t, _ in spk.calls]
+    _check("ctl.sign_focus_spoken",
+           SPEECH_TEXTS["safety_sign_ok"] in calls, str(calls))
+
+    # 专用点位缺失 → 专用异常文本；其他点位不受影响
+    cfg2 = InspectionConfig(pois=("SIGN_PT", "OTHER_PT"), dwell_seconds=0.02,
+                            poi_focus_classes={"SIGN_PT": ("safety_sign",)})
+    vision2 = _MockYoloInspector(
+        frame=_FAKE_FRAME, expect=("fire_extinguisher",), min_conf=0.65,
+        poi_focus_classes={"SIGN_PT": ("safety_sign",)},
+        detect_fn=lambda rgb: {
+            "detections": [det("fire_extinguisher", 0.9)],
+            "inference_ms": 1.0})
+    _, records2, _, _, _ = _run("ctl_sign_missing", SimNavigator(),
+                                SimSpeaker(), vision2, cfg2)
+    by_poi2 = {p["poi"]: p["speech"]["report"]["text"]
+               for p in _poi_records(records2)}
+    _check("ctl.sign_poi_missing_text",
+           by_poi2.get("SIGN_PT") == SPEECH_TEXTS["safety_sign_missing"]
+           and "灭火器" not in by_poi2.get("SIGN_PT", ""), str(by_poi2))
+    _check("ctl.other_poi_unchanged",
+           by_poi2.get("OTHER_PT") == SPEECH_TEXTS["extinguisher_ok"],
+           str(by_poi2))
+
+
+def test_manual_safety_sign_focus_speech():
+    """单点入口：映射内的点位播专用文本，未映射点位保持通用文案。"""
+    from inspection.report import SPEECH_TEXTS
+    rc, records, spk = _run_manual(
+        ["安全出口", "货架", "q"], poi_focus={"安全出口": ("safety_sign",)})
+    by_poi = {p["poi"]: p["speech"]["report"]["text"]
+              for p in _poi_records(records)}
+    _check("manual.sign_focus_rc0", rc == 0, f"rc={rc}")
+    _check("manual.sign_focus_text",
+           by_poi.get("安全出口") == SPEECH_TEXTS["safety_sign_ok"],
+           str(by_poi))
+    _check("manual.other_poi_not_sign",
+           by_poi.get("货架") != SPEECH_TEXTS["safety_sign_ok"], str(by_poi))
 
 
 def test_vis_timeout_controller_policy():
@@ -1175,36 +1631,39 @@ def test_report_texts():
         return Detection(class_name=name, confidence=conf,
                          xyxy=[0, 0, 5, 5])
 
+    from inspection.report import SPEECH_TEXTS
     expect = ("safety_sign", "fire_extinguisher")
     abnormal = ("smoking",)
 
-    # SUCCESS：引用实际达标检出，含"在位"，不含"火灾"
+    # SUCCESS：灭火器期望 → 固定文本"灭火器检查正常。"
     r = PoiInspection(status=InspectionStatus.SUCCESS, poi="P1",
                       detections=[det("safety_sign", 0.9),
                                   det("fire_extinguisher", 0.9)])
     t = build_speech_text("P1", r, expect_classes=expect,
                           abnormal_classes=abnormal, min_conf=0.65)
-    _check("report.success_items",
-           "灭火器" in t and "安全指示牌" in t and "未发现异常" in t, t)
+    _check("report.success_fixed_text",
+           t == SPEECH_TEXTS["extinguisher_ok"], t)
     _check("report.success_no_fire_word", "火灾" not in t, t)
 
-    # ABNORMAL(smoking)：只播"吸烟行为"，绝不播"火灾"
+    # ABNORMAL(smoking)：固定吸烟警告，绝不播"火灾"
+    # （本例未检出灭火器，按规则会追加缺失警告，故只断言吸烟文本在位）
     r = PoiInspection(status=InspectionStatus.ABNORMAL, poi="P2",
                       detections=[det("smoking", 0.9)])
     t = build_speech_text("P2", r, expect_classes=expect,
                           abnormal_classes=abnormal, min_conf=0.65,
                           conf_by_class={"smoking": 0.25})
     _check("report.abnormal_smoking",
-           "警告" in t and "吸烟行为" in t and "火灾" not in t, t)
+           SPEECH_TEXTS["smoking"] in t and "火灾" not in t, t)
 
-    # ABNORMAL 但达标检出里没有异常类（口径不一致）：兜底泛化文案，不编造类别
+    # ABNORMAL 且低置信度吸烟被阈值过滤 → 只剩灭火器缺失警告，不编造吸烟
     r = PoiInspection(status=InspectionStatus.ABNORMAL, poi="P3",
                       detections=[det("smoking", 0.1)])
     t = build_speech_text("P3", r, expect_classes=expect,
                           abnormal_classes=abnormal, min_conf=0.65,
                           conf_by_class={"smoking": 0.25})
     _check("report.abnormal_no_fabrication",
-           "异常" in t and "吸烟" not in t and "火灾" not in t, t)
+           t == SPEECH_TEXTS["extinguisher_missing"]
+           and "吸烟" not in t and "火灾" not in t, t)
 
     # UNCERTAIN：点名未能确认的期望目标
     r = PoiInspection(status=InspectionStatus.UNCERTAIN, poi="P4",
@@ -1240,14 +1699,14 @@ def test_vis_conf_by_class():
     _check("vis.per_class_smoking_abnormal",
            r.status is InspectionStatus.ABNORMAL, r.status.value)
 
-    # 其他类 0.55 在 min_conf=0.65 下不达标 → UNCERTAIN（不是 SUCCESS）
+    # 其他类 0.55 在 min_conf=0.65 下不达标 → 无效检出 → ABNORMAL（不是 SUCCESS）
     ins2 = _MockYoloInspector(
         frame=_FAKE_FRAME, conf_by_class={"smoking": 0.25}, min_conf=0.65,
         detect_fn=lambda rgb: {"detections": [det("fire_extinguisher", 0.55)],
                                "inference_ms": 1.0})
     r2 = ins2.inspect("P")
-    _check("vis.per_class_other_stricter",
-           r2.status is InspectionStatus.UNCERTAIN, r2.status.value)
+    _check("vis.per_class_other_stricter_abnormal",
+           r2.status is InspectionStatus.ABNORMAL, r2.status.value)
 
     # 缺省（无 conf_by_class）：0.55 ≥ 0.5 维持原行为 → SUCCESS
     ins3 = _MockYoloInspector(
@@ -1309,7 +1768,7 @@ class _ManualArgs:
     conf_other = 0.65
 
 
-def _run_manual(inputs, scenario="normal"):
+def _run_manual(inputs, scenario="normal", poi_focus=None):
     mod = _load_manual_mod()
     vision, spk = mod._build_sim(_FakeManualScenario(scenario))
     record_path = os.path.join(tempfile.mkdtemp(prefix="manual_test_"),
@@ -1326,7 +1785,8 @@ def _run_manual(inputs, scenario="normal"):
 
     rc = mod.run_loop(vision, spk, rec, _ManualArgs(),
                       conf_by_class={"smoking": 0.25},
-                      input_fn=input_fn, output_fn=lambda *a, **k: None)
+                      input_fn=input_fn, output_fn=lambda *a, **k: None,
+                      poi_focus_classes=poi_focus)
     with open(record_path, encoding="utf-8") as fp:
         records = [json.loads(line) for line in fp if line.strip()]
     return rc, records, spk
@@ -1451,6 +1911,7 @@ def main():
     test_vis_inference_timeout_and_poison()
     test_vis_inference_error()
     test_vis_judgement_logic()
+    test_vis_extinguisher_presence_rule()
     test_vis_timeout_controller_policy()
     print("=== TTS 语义与完成判定 Mock 测试 ===")
     test_tts_interrupt_calls_stop_then_append()
@@ -1475,9 +1936,17 @@ def main():
     print("=== 文案映射与单点闭环 Mock 测试 ===")
     test_report_texts()
     test_vis_conf_by_class()
+    test_report_extinguisher_presence_rule()
+    test_fixed_speech_texts()
+    test_report_safety_sign_texts()
+    test_poi_focus_parse()
+    test_controller_fixed_speech_routing()
+    test_controller_safety_sign_focus_speech()
     test_vis_to_bgr()
     test_manual_loop_basic()
     test_manual_loop_speech_fail_not_blocking()
+    test_manual_loop_speech_wiring()
+    test_manual_safety_sign_focus_speech()
     test_manual_loop_eof_and_interrupt()
     test_manual_gate()
     failed = [r for r in _results if r[1] == FAIL]

@@ -7,7 +7,10 @@
 判定规则（保守，宁可不确定也不误报正常）：
 - 检出 abnormal_classes 中任一类（如 smoking）且置信度达标 → ABNORMAL
 - 期望目标（expect_classes）全部检出且置信度达标 → SUCCESS
-- 有检出但置信度不足 / 期望目标缺失 → UNCERTAIN（不是"正常"）
+- absence_abnormal（默认仅 fire_extinguisher）中的类别缺失 → ABNORMAL：
+  灭火器"至少一个有效检出即正常"，不设数量上限；0 个有效检出
+  （含仅剩低于阈值的框）判定异常，低于阈值的框不计为检出成功
+- 其余期望目标缺失 → UNCERTAIN（不是"正常"）
 - 取图超时 / 推理超时 → 对应失败态（TIMEOUT / NO_FRAME）
 
 推理超时诚实声明（重要）：
@@ -23,7 +26,7 @@ from __future__ import annotations
 import queue
 import threading
 import time
-from typing import Optional, Sequence
+from typing import Mapping, Optional, Sequence
 
 from .types import Detection, InspectionStatus, PoiInspection
 
@@ -64,7 +67,7 @@ class SimInspector(InspectorBase):
         if self.mode == "abnormal":
             return PoiInspection(
                 status=InspectionStatus.ABNORMAL, poi=poi_name,
-                detections=[det("sim_smoking", 0.91)],
+                detections=[det("smoking", 0.91)],
                 detail="simulated abnormal", inference_ms=ms, simulated=True)
         if self.mode == "uncertain":
             return PoiInspection(
@@ -105,7 +108,9 @@ class YoloInspector(InspectorBase):
                  inference_timeout: float = 10.0,
                  min_conf: float = 0.5,
                  conf_by_class: Optional[dict] = None,
-                 to_bgr: bool = False):
+                 to_bgr: bool = False,
+                 absence_abnormal: Sequence[str] = ("fire_extinguisher",),
+                 poi_focus_classes: Optional[Mapping[str, Sequence[str]]] = None):
         if not model_path:
             raise ValueError(
                 "YoloInspector 需要真实模型路径；模型未到位请用 SimInspector")
@@ -124,6 +129,12 @@ class YoloInspector(InspectorBase):
                               auto_load=True)  # 文件不存在时 validate 抛错
         self._expect = tuple(expect_classes)
         self._abnormal = tuple(abnormal_classes)
+        # 这些类别"至少一个有效检出即正常、缺失即异常"（默认灭火器）
+        self._absence_abnormal = tuple(absence_abnormal)
+        # 显式配置的"点位 → 专用检查目标"；未配置的点位沿用全局规则。
+        # 禁止按 POI 名称猜测，映射只能由调用方明确给出。
+        self._poi_focus = {str(k): tuple(v)
+                           for k, v in (poi_focus_classes or {}).items()}
         self._camera_name = camera_name
         self._frame_timeout = frame_timeout
         self._inference_timeout = float(inference_timeout)
@@ -157,6 +168,34 @@ class YoloInspector(InspectorBase):
             return q.get(timeout=self._inference_timeout)
         except queue.Empty:
             return ("timeout", None)
+
+    def _conf_for(self, class_name: str) -> float:
+        """该类别的判定阈值：conf_by_class 未列出时回退 min_conf。"""
+        if self._class_conf:
+            return self._class_conf.get(class_name, self._min_conf)
+        return self._min_conf
+
+    def _focus_classes_for(self, poi_name: str) -> tuple:
+        """本点位显式配置的专用检查目标；未配置返回空（不猜名称）。"""
+        return self._poi_focus.get(poi_name, ())
+
+    # ── 判定参数只读暴露（供播报层按同一阈值口径生成文案）─────────
+
+    @property
+    def expect_classes(self) -> tuple:
+        return self._expect
+
+    @property
+    def abnormal_classes(self) -> tuple:
+        return self._abnormal
+
+    @property
+    def min_conf(self) -> float:
+        return self._min_conf
+
+    @property
+    def conf_by_class(self) -> Optional[dict]:
+        return dict(self._class_conf) if self._class_conf else None
 
     # ── 主入口 ─────────────────────────────────────────────────────
 
@@ -219,13 +258,7 @@ class YoloInspector(InspectorBase):
                 simulated=False,
             ))
 
-        if self._class_conf:
-            # 按类阈值过滤：未列出的类别回退到 min_conf
-            strong = [d for d in detections
-                      if d.confidence >= self._class_conf.get(d.class_name,
-                                                              self._min_conf)]
-        else:
-            strong = [d for d in detections if d.confidence >= self._min_conf]
+        strong = [d for d in detections if d.confidence >= self._conf_for(d.class_name)]
         hit_abnormal = [d for d in strong if d.class_name in self._abnormal]
         if hit_abnormal:
             return PoiInspection(
@@ -234,9 +267,35 @@ class YoloInspector(InspectorBase):
                 detail="检出异常: " + ",".join(d.class_name for d in hit_abnormal),
                 inference_ms=ms)
 
+        # 期望目标按"至少一个有效检出"判定：found 是类名集合，
+        # 同一目标的重复框天然去重，且不设数量上限（1/2/3/N 个都算在位）。
+        # 显式配置了专用目标的点位只按该目标判定，避免全局 expect
+        # 把其他点位的目标混进来。
+        focus = self._focus_classes_for(poi_name)
+        targets = focus if focus else self._expect
         found = {d.class_name for d in strong}
-        missing = [c for c in self._expect if c not in found]
+        missing = [c for c in targets if c not in found]
         if missing:
+            # 专用点位目标缺失即异常；非专用点沿用原 absence_abnormal 规则
+            critical = list(missing) if focus else [
+                c for c in missing if c in self._absence_abnormal]
+            if critical:
+                # 目标缺失 = 异常（不是"不确定"）。低于阈值的框不计成功，
+                # 但仍写进 detail 便于日志/记录区分"没看到"与"看到了但不够可信"。
+                rejected = [d for d in detections
+                            if d.class_name in critical
+                            and d.confidence < self._conf_for(d.class_name)]
+                if rejected:
+                    top = max(d.confidence for d in rejected)
+                    why = (f"仅检出低于阈值的框，最高 {top:.2f} < "
+                           f"{self._conf_for(rejected[0].class_name):.2f}")
+                else:
+                    why = "无检出"
+                return PoiInspection(
+                    status=InspectionStatus.ABNORMAL, poi=poi_name,
+                    detections=detections,
+                    detail=f"未检出有效目标 {critical}（{why}）",
+                    inference_ms=ms)
             return PoiInspection(
                 status=InspectionStatus.UNCERTAIN, poi=poi_name,
                 detections=detections,

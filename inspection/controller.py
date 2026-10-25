@@ -34,6 +34,7 @@ import time
 from dataclasses import dataclass, field
 from typing import Callable, Optional
 
+from .report import SPEECH_TEXTS, build_speech_text
 from .types import (
     InspectionStatus,
     NavOutcome,
@@ -69,18 +70,21 @@ class InspectionConfig:
     return_to_start: bool = False
     # 各阶段播报文案；None 表示该阶段不播报
     speech_texts: dict = field(default_factory=lambda: {
-        "start": "消防巡检开始，前往起点",
+        "start": SPEECH_TEXTS["start"],
         "arrive": "已到达{name}，开始检查",
         "normal": "{name}检查正常",
         "abnormal": "警告，{name}发现异常",
         "uncertain": "{name}检查结果不确定，请人工复核",
         "vision_failed": "{name}检查未完成",
         "nav_failed": "前往{name}失败，巡检终止",
-        "done": "全部点位巡检完成",
+        "done": SPEECH_TEXTS["done"],
         "cancelled": "巡检已取消",
     })
     # 视觉异常时是否中断巡检（True=播报警告后立即终止）
     abort_on_abnormal: bool = False
+    # 点位 → 专用检查目标类别（如 {"安全出口": ("safety_sign",)}）。
+    # 为空时所有点位沿用全局 expect 口径，不做任何名称猜测。
+    poi_focus_classes: dict = field(default_factory=dict)
 
 
 @dataclass
@@ -134,6 +138,35 @@ class InspectionController:
         interrupt = key in ("start", "abnormal", "nav_failed", "done",
                             "cancelled")
         return self.spk.say(text, interrupt=interrupt)
+
+    def _say_result(self, result, poi_name: str) -> SpeechResult:
+        """结果播报：按识别结论选择 report 中的固定文本。
+
+        - ABNORMAL：由 report 依据实际达标检出拼装（吸烟 / 专用目标缺失），
+          避免通用"发现异常"掩盖具体结论；绝不播报"火灾"。
+        - SUCCESS 且本点位配置了专用目标（如 safety_sign）：播专用正常文本；
+          未配置专用目标且期望灭火器时播"灭火器检查正常。"，不谎报其他点位。
+        其余状态沿用现有预设模板不变。
+        """
+        focus = tuple(self.cfg.poi_focus_classes.get(poi_name, ()))
+        if result.status is InspectionStatus.ABNORMAL or (
+                result.status is InspectionStatus.SUCCESS and focus):
+            insp = self.vision
+            text = build_speech_text(
+                poi_name, result,
+                expect_classes=getattr(insp, "expect_classes", ()),
+                abnormal_classes=getattr(insp, "abnormal_classes", ()),
+                min_conf=getattr(insp, "min_conf", 0.5),
+                conf_by_class=getattr(insp, "conf_by_class", None),
+                focus_classes=focus)
+            return self.spk.say(
+                text, interrupt=result.status is InspectionStatus.ABNORMAL)
+        if result.status is InspectionStatus.SUCCESS:
+            expect = getattr(self.vision, "expect_classes", ())
+            if "fire_extinguisher" in expect:
+                return self.spk.say(SPEECH_TEXTS["extinguisher_ok"],
+                                    interrupt=False)
+        return self._say(self._speech_key_for(result.status), name=poi_name)
 
     def _interruptible_sleep(self, seconds: float) -> bool:
         """返回 True 表示正常睡完，False 表示被 cancel 打断。"""
@@ -276,10 +309,9 @@ class InspectionController:
         record.inspection = result.to_dict()
         record.pose = self._safe_pose()
 
-        # 4) 结果播报
+        # 4) 结果播报（固定文本：灭火器正常 / 吸烟警告 / 灭火器缺失）
         self._set(State.REPORT, poi_name)
-        key = self._speech_key_for(result.status)
-        rec_speech["report"] = self._say(key, name=poi_name).to_dict()
+        rec_speech["report"] = self._say_result(result, poi_name).to_dict()
 
         if result.status is InspectionStatus.ABNORMAL and self.cfg.abort_on_abnormal:
             record.final = "abnormal_abort"

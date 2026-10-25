@@ -14,7 +14,7 @@
     success          全流程正常（默认）
     nav_fail         POI_02 轨道导航失败
     nav_timeout      POI_02 轨道导航超时
-    vision_abnormal  每个点都检出 sim_smoking（模拟异常）
+    vision_abnormal  每个点都检出 smoking（模拟异常）
     vision_uncertain 每个点都低置信度（模拟不确定）
     vision_timeout   每个点视觉超时
     vision_no_frame  每个点取图失败
@@ -27,6 +27,9 @@
     --model PATH     消防模型权重（.pt/.onnx/.engine），缺省=视觉 NO_MODEL 拒绝
     --expect CLS...  期望检出类别（来自队友类别清单，缺省空=不启用真实视觉判定）
     --abnormal CLS   异常类别（如 smoking），可多次
+    --poi-focus POI=CLASS[,CLASS]
+                     显式指定某点位的专用检查目标（如 安全出口=safety_sign）；
+                     可多次，未配置的点位沿用全局 --expect 口径
 """
 
 import argparse
@@ -40,6 +43,7 @@ if _SRC_DIR not in sys.path:
 
 from inspection.controller import InspectionConfig, InspectionController, State
 from inspection.recorder import InspectionRecorder
+from inspection.report import parse_poi_focus
 from inspection.types import now_iso
 
 
@@ -82,6 +86,8 @@ def _confirm_real(cfg, args, input_fn=None) -> bool:
           flush=True)
     print(f"  异常类别 : {list(args.abnormal) if args.abnormal else '未配置'}",
           flush=True)
+    print(f"  专用点位 : {getattr(args, 'poi_focus_map', None) or '未配置'}",
+          flush=True)
     print(f"  记录文件 : {args.record}", flush=True)
     print("=" * 60, flush=True)
 
@@ -116,7 +122,7 @@ def _confirm_real(cfg, args, input_fn=None) -> bool:
 
 # ── 模拟模式 ────────────────────────────────────────────────────────
 
-def build_sim(scenario: str):
+def build_sim(scenario: str, poi_focus=None):
     from inspection.inspector import SimInspector
     from inspection.navigator import SimNavigator
     from inspection.speaker import SimSpeaker
@@ -124,7 +130,8 @@ def build_sim(scenario: str):
     nav = SimNavigator(delay_s=0.02)
     vision = SimInspector(mode="normal", latency_s=0.02)
     spk = SimSpeaker(mode="ok", latency_s=0.01)
-    cfg = InspectionConfig(dwell_seconds=0.05)  # 模拟用短停留
+    cfg = InspectionConfig(dwell_seconds=0.05,  # 模拟用短停留
+                           poi_focus_classes=dict(poi_focus or {}))
 
     if scenario == "nav_fail":
         nav = SimNavigator(fail_at="POI_02", outcome="failed", delay_s=0.02)
@@ -143,7 +150,8 @@ def build_sim(scenario: str):
     elif scenario == "speech_timeout":
         spk = SimSpeaker(mode="query_timeout", latency_s=0.01)
     elif scenario == "return_start":
-        cfg = InspectionConfig(dwell_seconds=0.05, return_to_start=True)
+        cfg = InspectionConfig(dwell_seconds=0.05, return_to_start=True,
+                               poi_focus_classes=dict(poi_focus or {}))
     elif scenario == "user_cancel":
         pass  # 取消由 run_sim 里的线程注入
     elif scenario != "success":
@@ -153,10 +161,12 @@ def build_sim(scenario: str):
 
 
 def run_sim(args) -> int:
-    nav, spk, vision, cfg = build_sim(args.scenario)
+    nav, spk, vision, cfg = build_sim(
+        args.scenario, getattr(args, "poi_focus_map", None))
     rec = InspectionRecorder(args.record, meta={
         "mode": "simulate", "scenario": args.scenario, "simulated": True,
         "pois": list(cfg.pois), "start_poi": cfg.start_poi,
+        "poi_focus": {k: list(v) for k, v in cfg.poi_focus_classes.items()},
     })
     ctl = InspectionController(nav, spk, vision, rec, cfg,
                                on_transition=_print_transition)
@@ -193,7 +203,9 @@ def run_real(args) -> int:
     from inspection.navigator import ChassisNavigator
     from inspection.speaker import make_tts_speaker
 
-    cfg = InspectionConfig(return_to_start=args.return_start)
+    poi_focus = dict(getattr(args, "poi_focus_map", None) or {})
+    cfg = InspectionConfig(return_to_start=args.return_start,
+                           poi_focus_classes=poi_focus)
 
     # 二次确认门控：未通过前不导入/连接 robot_controller，不触任何硬件
     if not _confirm_real(cfg, args):
@@ -211,7 +223,8 @@ def run_real(args) -> int:
         if args.model:
             vision = YoloInspector(
                 robot, model_path=args.model,
-                expect_classes=args.expect, abnormal_classes=args.abnormal)
+                expect_classes=args.expect, abnormal_classes=args.abnormal,
+                poi_focus_classes=poi_focus)
         else:
             print("[!] 未提供 --model，视觉使用 NO_MODEL 拒绝桩"
                   "（每个点都会记为 no_model，不会误报正常）", flush=True)
@@ -228,6 +241,7 @@ def run_real(args) -> int:
             "mode": "real", "simulated": False,
             "pois": list(cfg.pois), "start_poi": cfg.start_poi,
             "model": args.model,
+            "poi_focus": {k: list(v) for k, v in poi_focus.items()},
         })
         ctl = InspectionController(nav, spk, vision, rec, cfg,
                                    on_transition=_print_transition)
@@ -258,7 +272,17 @@ def main() -> int:
     ap.add_argument("--max-speed", type=float, default=0.4)
     ap.add_argument("--return-start", action="store_true",
                     help="实机模式：结束后返回起点")
+    ap.add_argument("--poi-focus", action="append", default=[],
+                    metavar="POI=CLASS[,CLASS]",
+                    help="显式指定某点位的专用检查目标，可多次；"
+                         "未配置的点位沿用全局 --expect/--abnormal 口径")
     args = ap.parse_args()
+
+    try:
+        args.poi_focus_map = parse_poi_focus(args.poi_focus)
+    except ValueError as exc:
+        print(f"[X] --poi-focus 配置无效: {exc}", flush=True)
+        return 2
 
     if args.real:
         return run_real(args)
