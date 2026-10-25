@@ -1,0 +1,15 @@
+# goal
+string poi               # 点位名，以底盘 POI 服务端为准
+bool is_return           # true=返回起点；此时 poi 必须是 start_poi，允许中途撤退
+float32 timeout_s        # 0 表示使用配置默认超时
+---
+# result
+bool success
+bool is_return           # 回显本次 goal 是否为"返回起点"
+string message           # 人类可读说明，含进度快照，不可作为机器解析契约
+string phase             # 终态分类：arrived | failed | cancelled（timeout 待实机运动实现）
+---
+# feedback
+string phase             # navigating | arrived（retrying | relocalizing 待实机运动实现）
+string mode              # point | track：当前段采用的导航方式
+float32 distance_remaining_m   # 距目标直线距离（m）；arrived 时为 0

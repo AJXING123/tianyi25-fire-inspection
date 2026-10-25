@@ -10,16 +10,17 @@
 - **构建**：colcon（`ament_cmake` + `ament_python`）
 - **语言**：Python 3（`rclpy`）
 
-> ⚠️ **当前阶段：导航 dry_run 已实现，其余为骨架**
+> ⚠️ **当前阶段：导航 dry_run、视觉检查、头部扫视已实现；语音与编排层为骨架**
 >
 > | 模块 | 状态 |
 > | --- | --- |
-> | `fire_inspection_nav` | ✅ dry_run 只读链路已实现（读 POI 表 / 轨道 / 定位状态，不下发运动） |
+> | `fire_inspection_nav` | ✅ dry_run 只读链路（POI/轨道/定位校验、顺序管控、取消、并发互斥、超时参数、返回起点） |
+> | `fire_inspection_vision` | ✅ InspectPoi 服务端（头部相机取图 + YOLO 推理 + 判定，无模型/无图/超时绝不判正常） |
+> | `fire_inspection_head` | ✅ 头部扫视服务端（`/fire_inspection/head_sweep_cmd` 控制、手柄急停、systemd 自启） |
 > | `fire_inspection_voice` | ⬜ 骨架，未注册 Action、不调 TTS |
-> | `fire_inspection_vision` | ⬜ 骨架，未注册 Action、不加载模型 |
 > | `fire_inspection_orchestrator` | ⬜ 骨架，未实现状态机 |
 >
-> **实机运动尚未实现**：`dry_run:=false` 时导航 goal 会直接返回失败并说明原因。 
+> **实机运动尚未实现**：`dry_run:=false` 时导航 goal 会直接返回失败并说明原因。
 > 导航服务端只使用底盘 SDK，不初始化 `robot_controller` 门面，避免连带拉起手臂 / 手部 / 相机。
 > dry_run 下定位状态异常（`slam_status != 0`）只告警不拒绝，因为不下发运动；实机模式必须严格通过。
 
@@ -62,8 +63,9 @@ fire_inspection_ws/
 │   ├── fire_inspection_nav/             # ② 轨道导航服务端（NavigateTo Action）
 │   ├── fire_inspection_voice/           # ③ 语音播报服务端（Speak Action）
 │   ├── fire_inspection_vision/          # ④ 视觉检查服务端（InspectPoi Action）
-│   └── fire_inspection_orchestrator/    # ⑤ 编排层（唯一指挥者 / 唯一状态机 + 一键 bringup）
-├── build/  install/  log/               # colcon 产物
+│   ├── fire_inspection_head/            # ⑤ 头部扫视服务端（/head/cmd + 手柄急停）
+│   └── fire_inspection_orchestrator/    # ⑥ 编排层（唯一指挥者 / 唯一状态机 + 一键 bringup）
+├── build/  install/  log/               # colcon 产物（不入库）
 └── README.md
 ```
 
@@ -77,7 +79,8 @@ fire_inspection_ws/
 | ② | `fire_inspection_nav` | `ament_python` | 底盘 REST 导航服务端，沿轨道逐点到点 | `navigate_to_server` |
 | ③ | `fire_inspection_voice` | `ament_python` | 平台 TTS 播报服务端 | `speak_action_server` |
 | ④ | `fire_inspection_vision` | `ament_python` | 取图 + YOLO，判定点位设施是否正常 | `inspect_action_server` |
-| ⑤ | `fire_inspection_orchestrator` | `ament_python` | 状态机，按点位顺序调用三个 Action | `orchestrator_node` |
+| ⑤ | `fire_inspection_head` | `ament_python` | 头部扫视，按配置序列下发 `/head/cmd`，手柄可急停 | `head_sweep_server` |
+| ⑥ | `fire_inspection_orchestrator` | `ament_python` | 状态机，按点位顺序调用三个 Action | `orchestrator_node` |
 
 ### 自建接口
 
@@ -101,10 +104,13 @@ fire_inspection_interfaces ──（所有包的接口依赖，最底层）
         ├──► fire_inspection_vision   （InspectPoi）
         │
         └──► fire_inspection_orchestrator（唯一指挥者）
+
+fire_inspection_head ──（独立链路：直接下发 /head/cmd，不经过接口包）
 ```
 
 - 构建顺序由包依赖自动决定；`--symlink-install` 便于改 Python / 配置后免重建。
-- `interaction_msgs` 来自 `/home/nvidia/xos`，`rosdep` 无法解析，只能通过 `source` 提供。
+- `interaction_msgs`（voice）、`ros2_bridge_msgs`（head）来自 `/home/nvidia/xos`，
+  `rosdep` 无法解析，只能通过 `source` 提供。
 
 ---
 
@@ -168,9 +174,26 @@ start_point → POI_01 → POI_02 → POI_03
 | `ros2 launch fire_inspection_nav navigate_to.launch.py` | 仅导航服务端 | nav |
 | `ros2 launch fire_inspection_voice speak.launch.py` | 仅语音服务端 | voice |
 | `ros2 launch fire_inspection_vision inspect.launch.py` | 仅视觉服务端 | vision |
+| `ros2 launch fire_inspection_head head_sweep.launch.py` | 仅头部扫视（`auto_start:=true` 可延时自启） | head |
 | `ros2 launch fire_inspection_orchestrator orchestrator.launch.py` | 仅编排层（调试用） | orchestrator |
 
 所有 launch 均支持 `dry_run:=true|false`；`inspection_bringup.launch.py` 会把该参数透传给四个子链路。
+
+### 头部扫视开机自启（systemd）
+
+模板在 `fire_inspection_head/scripts/head-sweep.service`，安装：
+
+```bash
+sudo cp src/fire_inspection_head/scripts/head-sweep.service /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now head-sweep.service
+```
+
+> ⚠️ 该模板是**本机部署文件**，`User=nvidia`、`HOME=/home/nvidia`、
+> `/home/nvidia/xos`、`/home/nvidia/fire-inspection/fire_inspection_ws/install` 都是本机绝对路径；
+> 换机器直接使用会启动失败，需按实际用户与安装路径修改。
+> 它同时 `After=` / `Wants=` `robot-control.service`，若你的底盘服务名不同要一并改。
+> 自启时通过 `auto_start:=true` 延时（`auto_start_delay_s`，默认 30s）等 `/robot_state` 就绪。
 
 ### 5.1 导航 dry_run 验证
 
@@ -183,11 +206,34 @@ ros2 action send_goal /inspection/navigate_to fire_inspection_interfaces/action/
 ros2 action send_goal /inspection/navigate_to fire_inspection_interfaces/action/NavigateTo "{poi: 'POI_01'}"
 ros2 action send_goal /inspection/navigate_to fire_inspection_interfaces/action/NavigateTo "{poi: 'POI_02'}"
 ros2 action send_goal /inspection/navigate_to fire_inspection_interfaces/action/NavigateTo "{poi: 'POI_03'}"
+# 返回起点：is_return 必须为 true，且 poi 固定为 start_point
+ros2 action send_goal /inspection/navigate_to fire_inspection_interfaces/action/NavigateTo "{poi: 'start_point', is_return: true}"
 ```
 
 预期行为：
 - 顺序不对（如重复请求 `POI_01`）会返回 `success: false`，提示"点位顺序不匹配"；
-- `start_point` 走点对点，后续点走唯一轨道；
+- `is_return: true` 只用于"返回起点"：`poi` 非 `start_poi` 会被拒绝；未开始巡检时不能返回；
+  已在起点时重复返回会被拒绝；中途返回后，下一个正常 goal 从原进度继续，不重走已完成点位；
+- 首个 `start_point` 走点对点，其余段（含返回起点）走唯一轨道；
+- `timeout_s` 传 0 或缺省时：`is_return: true` 用 `per_poi_s`，首次前往起点用 `to_start_s`，
+  其余用 `per_poi_s`（返程不再借用 `to_start_s`）；
+- 配置自检：`start_poi` 不得出现在 `poi_order`，`poi_order` 不得有重复项，
+  违规时前置校验失败并拒绝所有 goal；
+- `range_limit` 生效：POI 坐标超出 `pois.yaml` 的软限位、限位格式非法、或出现未知键，
+  都会让前置校验失败；
+- POI 与轨道航点的位置偏差只做告警（>0.5m 时提示），不拒绝，避免影响现场微调点位；
+- 前置校验失败不会永久锁死：后台按 `preflight_retry_interval_s`（默认 5s）重试，
+  重试期间 goal 立即返回失败而不是卡住客户端；底盘晚启动时不必重启节点；
+- 一轮走完并回到起点后，请求 `start_point` 或直接请求首个点位 `POI_01`（`is_return: false`）
+  都会开始新一轮并自动复位进度；
+- 刚到达起点、尚未出发时 `is_return: true` 会被拒绝（无意义的原返回）；
+- POI 名会去除首尾空白，`"POI_01 "` 与 `"POI_01"` 等价；空名字直接拒绝；
+- 同一时刻只接受一个 goal，并发请求会被直接拒绝；
+- `cancel` 在 50ms 内生效，结果 `phase=cancelled`；
+- feedback 的 `phase` 为纯枚举（`navigating` / `arrived`），导航方式在 `mode` 字段（`point` / `track`），
+  `distance_remaining_m` 是当前位姿到目标的**直线距离**（不是沿轨道剩余里程，`arrived` 时为 0）；
+- 结果 `is_return` 回显本次 goal 类型，编排层据此区分"前往"与"返回"，不要解析 `message`；
+- `message` 会带进度快照（已开始 / 已返回 / 已完成数 / 下一站），仅作人类可读说明；
 - 结果里 `[dry_run]` 前缀表示未下发任何运动指令。
 
 ---
@@ -199,7 +245,12 @@ ros2 action send_goal /inspection/navigate_to fire_inspection_interfaces/action/
 | `fire_inspection_nav/config/pois.yaml` | 点位顺序、超时、应用层软限位 | 坐标以底盘 POI 服务端为准，**禁止写第二份坐标** |
 | `fire_inspection_voice/config/voice.yaml` | TTS 服务名、`audio_id`、完成判定时序 | 完成判定只认 `status == "playing"` |
 | `fire_inspection_vision/config/vision.yaml` | 相机、模型路径、置信度、超时 | 模型路径留空即视为 `NO_MODEL` |
+| `fire_inspection_head/config/head_sweep.yaml` | 扫视序列、节奏、发布频率、手柄急停键 | 改参数需重启节点，不用重编译 |
 | `fire_inspection_orchestrator/config/inspection_script.yaml` | 点位检查项、播报文案、流程开关 | 流程编排的唯一真源 |
+
+> **模型权重不入库**（见仓库根 `.gitignore`）：手工把权重放到仓库根的 `models/`，
+> 例如 `models/fire_3cls_v2.pt`，并让 `vision.yaml` 的 `model_path` 指向它。
+> 权重缺失时视觉结果为 `NO_MODEL`，不会把点位判为正常。
 
 ---
 
@@ -209,10 +260,10 @@ ros2 action send_goal /inspection/navigate_to fire_inspection_interfaces/action/
 | --- | --- |
 | 系统 | Ubuntu 24.04 |
 | ROS | ROS 2 Jazzy（`/opt/ros/jazzy`） |
-| 实机平台 | `/home/nvidia/xos`（提供 `interaction_msgs`），编译与运行前需 `source` |
+| 实机平台 | `/home/nvidia/xos`（提供 `interaction_msgs`、`ros2_bridge_msgs`），编译与运行前需 `source` |
 | 底盘 | knewbots 固件 REST API，默认 `http://192.168.11.10:9090` |
-| Python 依赖 | `python3-requests`（底盘 REST）、`python3-yaml`（配置解析） |
-| 视觉 | `ultralytics` / 推理运行时（模型权重路径由 launch 参数传入） |
+| Python 依赖 | `python3-requests`（底盘 REST）、`python3-yaml`（配置解析）、`opencv` / `numpy`（视觉） |
+| 视觉 | `ultralytics` / 推理运行时（模型权重路径由 `vision.yaml` 指定） |
 
 ```bash
 # 若 RSP 因日志目录权限拒绝启动，先改日志目录

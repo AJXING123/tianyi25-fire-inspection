@@ -1,0 +1,36 @@
+# 消防巡检头部扫视配置（改这里不用重编译，但需要重启节点）
+
+# 发布频率：/head/cmd 需要持续下发，100Hz 实测稳定
+publish_rate_hz: 100.0
+speed: 0.15
+current: 2.0
+
+# 每步过渡时长与停留时长：放慢节奏给视觉推理留时间
+step_duration_s: 2.0
+step_dwell_s: 3.0
+
+# true = 只打印不发布 /head/cmd（台架调试用）
+dry_run: false
+
+cmd_topic: /fire_inspection/head_sweep_cmd
+status_topic: /fire_inspection/head_status
+head_cmd_topic: /head/cmd
+robot_state_topic: /robot_state
+
+# 手柄急停：轴5 正 且 轴4 负（G 拨右 + E 拨上）
+joy_topic: /sbus_data
+stop_axes: [[5, 1], [4, -1]]
+axis_threshold: 0.5
+
+# 开机自启时延迟多少秒开始扫视（等待 robot_control 与 /robot_state 就绪）
+auto_start_delay_s: 30.0
+
+# 关节：1=roll(保持0) 2=pitch(正=低头) 3=yaw(正=向左)
+# 序列：低头左右 -> 平视左右 -> 微抬头左右
+steps:
+  - {name: "低头+左", pose: [0.0,  0.22,  0.35]}
+  - {name: "低头+右", pose: [0.0,  0.22, -0.35]}
+  - {name: "平视+左", pose: [0.0,  0.00,  0.35]}
+  - {name: "平视+右", pose: [0.0,  0.00, -0.35]}
+  - {name: "微抬头+左", pose: [0.0, -0.15,  0.35]}
+  - {name: "微抬头+右", pose: [0.0, -0.15, -0.35]}

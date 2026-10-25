@@ -1,0 +1,25 @@
+<?xml version="1.0"?>
+<?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
+<package format="3">
+  <name>fire_inspection_voice</name>
+  <version>0.1.0</version>
+  <description>消防巡检语音服务端：Speak Action，包装平台 TTS（/intelligent_interaction/tts/play）。</description>
+  <maintainer email="nvidia@example.com">nvidia</maintainer>
+  <license>Apache-2.0</license>
+
+  <depend>rclpy</depend>
+  <depend>fire_inspection_interfaces</depend>
+  <depend>interaction_msgs</depend>
+  <depend>launch</depend>
+  <depend>launch_ros</depend>
+  <depend>python3-yaml</depend>
+
+  <test_depend>ament_copyright</test_depend>
+  <test_depend>ament_flake8</test_depend>
+  <test_depend>ament_pep257</test_depend>
+  <test_depend>python3-pytest</test_depend>
+
+  <export>
+    <build_type>ament_python</build_type>
+  </export>
+</package>

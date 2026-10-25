@@ -1,0 +1,30 @@
+# 消防巡检流程配置 —— 编排层唯一真源
+version: "0.1"
+approved_version: "0.1"
+
+start_poi: start_point
+return_to_start: false
+dwell_s: 3.0
+
+# 各阶段播报文案；null 表示该阶段不播报
+speech:
+  start: "消防巡检开始，前往起点"
+  arrive: "已到达{name}，开始检查"
+  normal: "{name}检查正常"
+  abnormal: "警告，{name}发现异常"
+  uncertain: "{name}检查结果不确定，请人工复核"
+  nav_failed: "前往{name}失败，巡检终止"
+  done: "全部点位巡检完成"
+  cancelled: "巡检已取消"
+
+# 点位检查项（坐标以底盘 POI 服务端为准，此处只写检查语义）
+pois:
+  - name: POI_01
+    expect_classes: []
+    abnormal_classes: [smoking, fire]
+  - name: POI_02
+    expect_classes: []
+    abnormal_classes: [smoking, fire]
+  - name: POI_03
+    expect_classes: []
+    abnormal_classes: [smoking, fire]
