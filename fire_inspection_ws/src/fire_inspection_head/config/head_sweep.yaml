@@ -22,6 +22,11 @@ status_topic: /fire_inspection/head_status
 head_cmd_topic: /head/cmd
 robot_state_topic: /robot_state
 
+# 相机视场角（契约 §9：orchestrator 用 look_at 开环换算头部目标角）
+# 初值 80° / 60°，现场标定后回填接口契约冻结表 §9
+h_fov_deg: 80.0
+v_fov_deg: 60.0
+
 # 手柄急停：轴5 正 且 轴4 负（G 拨右 + E 拨上）
 joy_topic: /sbus_data
 stop_axes: [[5, 1], [4, -1]]
