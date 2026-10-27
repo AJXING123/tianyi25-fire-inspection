@@ -9,6 +9,11 @@ current: 2.0
 step_duration_s: 2.0
 step_dwell_s: 3.0
 
+# look_at:<yaw>,<pitch> 转向目标的过渡时长（秒）
+look_duration_s: 1.2
+# center / stop 回中位的过渡时长（秒）
+center_duration_s: 1.5
+
 # true = 只打印不发布 /head/cmd（台架调试用）
 dry_run: false
 
@@ -26,11 +31,12 @@ axis_threshold: 0.5
 auto_start_delay_s: 30.0
 
 # 关节：1=roll(保持0) 2=pitch(正=低头) 3=yaw(正=向左)
-# 序列：低头左右 -> 平视左右 -> 微抬头左右
+# 实测：相机装在头部偏高，目标（灭火器/烟头）都在视线下方，
+# 所以整条序列整体下压，不再留抬头步。
 steps:
-  - {name: "低头+左", pose: [0.0,  0.22,  0.35]}
-  - {name: "低头+右", pose: [0.0,  0.22, -0.35]}
+  - {name: "大低头+左", pose: [0.0,  0.38,  0.35]}
+  - {name: "大低头+右", pose: [0.0,  0.38, -0.35]}
+  - {name: "中低头+左", pose: [0.0,  0.26,  0.35]}
+  - {name: "中低头+右", pose: [0.0,  0.26, -0.35]}
   - {name: "平视+左", pose: [0.0,  0.00,  0.35]}
   - {name: "平视+右", pose: [0.0,  0.00, -0.35]}
-  - {name: "微抬头+左", pose: [0.0, -0.15,  0.35]}
-  - {name: "微抬头+右", pose: [0.0, -0.15, -0.35]}
