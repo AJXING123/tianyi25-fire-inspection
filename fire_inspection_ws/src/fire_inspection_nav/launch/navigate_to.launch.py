@@ -7,7 +7,8 @@
     ros2 launch fire_inspection_nav navigate_to.launch.py
     ros2 launch fire_inspection_nav navigate_to.launch.py config_file:=/path/to/pois.yaml
 
-dry_run:=true 只做只读校验；dry_run:=false 走实机轨道运动（需已重定位）。
+dry_run:=true 只做只读校验；dry_run:=false 走实机轨道运动。
+实机定位异常时可按 pois.yaml 的 relocalize.enabled 自动重定位一次。
 """
 
 from launch import LaunchDescription
