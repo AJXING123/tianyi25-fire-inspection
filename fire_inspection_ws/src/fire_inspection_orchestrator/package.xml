@@ -9,6 +9,7 @@
 
   <exec_depend>rclpy</exec_depend>
   <exec_depend>std_msgs</exec_depend>
+  <exec_depend>ros2_bridge_msgs</exec_depend>
   <exec_depend>fire_inspection_interfaces</exec_depend>
   <exec_depend>fire_inspection_nav</exec_depend>
   <exec_depend>fire_inspection_voice</exec_depend>

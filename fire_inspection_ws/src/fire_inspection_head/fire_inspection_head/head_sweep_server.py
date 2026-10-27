@@ -1,9 +1,18 @@
 """消防巡检头部扫视服务端（机器人端）。
 
-临时控制接口（未改动 fire_inspection_interfaces，后续可升级为 Action）：
-  /fire_inspection/head_sweep_cmd   std_msgs/String   start | stop
-  /fire_inspection/head_status      std_msgs/String   idle / sweeping / step:N:名称 / stopping / stopped
+控制接口（std_msgs/String）：
+  /fire_inspection/head_sweep_cmd
+    start                     开始循环扫视（从第 1 步）
+    pause                     暂停扫视，头部保持当前姿态（不回中）
+    resume                    从暂停的那一步继续扫视
+    look_at:<yaw>,<pitch>     头部转向指定绝对姿态（弧度），到位后持续保持
+    center                    头部回中位并保持
+    stop                      终止扫视并回中
+    status                    上报当前状态
+  /fire_inspection/head_status
+    idle / sweeping / step:N:名称 / paused / looking / holding / stopping / stopped
 
+任意时刻只有本节点的 motion 线程向 /head/cmd 发指令，避免多线程互抢。
 扫视序列、节奏、发布频率、手柄停止键都来自 config/head_sweep.yaml，改参数不必重编译。
 手柄急停：/sbus_data 轴5 > +0.5 且 轴4 < -0.5（G 拨右 + E 拨上），上升沿触发；
 开机时若拨杆已停在触发位，首帧不算，需要松手再拨一次。
@@ -13,6 +22,7 @@ from __future__ import annotations
 
 import os
 import threading
+import time
 
 import rclpy
 import yaml
@@ -45,6 +55,10 @@ class HeadSweepServer(Node):
         self.current = float(cfg.get("current", 2.0))
         self.duration = float(cfg.get("step_duration_s", 2.0))
         self.dwell = float(cfg.get("step_dwell_s", 3.0))
+        self.look_duration = float(cfg.get("look_duration_s", 1.2))
+        self.center_duration = float(cfg.get("center_duration_s", 1.5))
+        self.rate = float(cfg.get("publish_rate_hz", 100.0))
+        self.period = 1.0 / max(1.0, self.rate)
         self.steps = list(cfg.get("steps") or [])
         self.stop_axes = [(int(i), 1.0 if float(s) > 0 else -1.0)
                           for i, s in cfg.get("stop_axes", [[5, 1], [4, -1]])]
@@ -58,7 +72,7 @@ class HeadSweepServer(Node):
             self,
             cmd_topic=cfg.get("head_cmd_topic", "/head/cmd"),
             state_topic=cfg.get("robot_state_topic", "/robot_state"),
-            rate=float(cfg.get("publish_rate_hz", 100.0)),
+            rate=self.rate,
             dry_run=self.dry_run,
         )
 
@@ -66,10 +80,16 @@ class HeadSweepServer(Node):
         self.create_subscription(String, cmd_topic, self._on_cmd, 10)
         self.create_subscription(Joy, joy_topic, self._on_joy, 10)
 
+        # sweep = 扫视 / look = 保持某个指定姿态
+        self._mode = "sweep"
+        self._look_target = [0.0, 0.0, 0.0]
+        self._step_idx = 0
         self._stop_evt = threading.Event()
+        self._pause_evt = threading.Event()
         self._worker = None
         self._lock = threading.Lock()
         self._prev_joy = None
+        self._state = "idle"
 
         self.get_logger().info(
             f"头部扫视服务端就绪 cmd={cmd_topic} status={status_topic} "
@@ -82,15 +102,38 @@ class HeadSweepServer(Node):
 
     # ---------- 外部指令 ----------
     def _on_cmd(self, msg):
-        cmd = msg.data.strip().lower()
+        raw = msg.data.strip()
+        cmd = raw.lower()
         if cmd in ("start", "begin", "sweep"):
             self.start_sweep()
+        elif cmd in ("pause", "hold"):
+            self.pause_sweep()
+        elif cmd in ("resume", "continue", "go"):
+            self.resume_sweep()
+        elif cmd == "center":
+            self.center_look()
+        elif cmd.startswith("look_at"):
+            self._parse_look_at(raw)
         elif cmd in ("stop", "cancel"):
             self._request_stop("收到停止指令")
-        elif cmd in ("status",):
-            self._publish("sweeping" if self.is_running else "idle")
+        elif cmd == "status":
+            self._publish_state()
         else:
-            self.get_logger().warn(f"未知指令: {msg.data!r}（支持 start / stop / status）")
+            self.get_logger().warn(
+                f"未知指令: {raw!r}（支持 start/pause/resume/"
+                f"look_at:yaw,pitch/center/stop/status）")
+
+    def _parse_look_at(self, raw):
+        try:
+            _, args = raw.split(":", 1)
+            yaw_s, pitch_s = args.split(",")
+            yaw = float(yaw_s)
+            pitch = float(pitch_s)
+        except ValueError:
+            self.get_logger().warn(
+                f"look_at 参数非法: {raw!r}（格式 look_at:yaw,pitch，单位弧度）")
+            return
+        self.look_at(yaw, pitch)
 
     def _on_joy(self, msg):
         satisfied = True
@@ -112,25 +155,71 @@ class HeadSweepServer(Node):
         return self._worker is not None and self._worker.is_alive()
 
     def _auto_start_once(self):
+        # 控制栈没就绪就不动头，等下一个周期再来（/robot_state 无数据时起扫会空跑）
+        if not self.adapter.pose_ready:
+            self.get_logger().warn("等待 /robot_state 就绪，暂不自动开始扫视")
+            return
         # 只自动启动一次：手柄按下停止后不会被定时器重新拉起
         self._auto_timer.cancel()
         if not self.is_running:
             self.start_sweep()
 
     def start_sweep(self):
+        if not self.steps:
+            self.get_logger().error("head_sweep.yaml 里没有 steps，拒绝启动")
+            return
+        if self.is_running and self._mode == "sweep" and not self._pause_evt.is_set():
+            self.get_logger().info("扫视已在进行中，忽略 start")
+            return
+        self._step_idx = 0
+        self._pause_evt.clear()
+        self._ensure_worker("sweep")
+        self._publish("sweeping")
+
+    def pause_sweep(self):
+        if not self.is_running:
+            self.get_logger().info("当前未在扫视，pause 忽略")
+            return
+        self._pause_evt.set()
+        self.adapter.stop_requested = True
+        self.get_logger().info(f"暂停扫视，保持当前姿态（第 {self._step_idx + 1} 步）")
+
+    def resume_sweep(self):
+        if not self.steps:
+            self.get_logger().error("head_sweep.yaml 里没有 steps，拒绝启动")
+            return
+        self._pause_evt.clear()
+        if self.is_running:
+            # 线程还活着：切回 sweep，look 的保持循环会在下一拍退出
+            self._mode = "sweep"
+        else:
+            self._ensure_worker("sweep")
+        self.get_logger().info(f"恢复扫视，从第 {self._step_idx + 1} 步继续")
+
+    def look_at(self, yaw, pitch):
+        self._look_target = [0.0, float(pitch), float(yaw)]
+        self._ensure_worker("look")
+        self.get_logger().info(f"看向 yaw={yaw:.3f} pitch={pitch:.3f} rad（关节限位内自动裁剪）")
+
+    def center_look(self):
+        self.look_at(0.0, 0.0)
+        self.get_logger().info("头部回中位并保持")
+
+    def _ensure_worker(self, mode):
         with self._lock:
+            self._mode = mode
             if self.is_running:
-                self.get_logger().info("扫视已在进行中，忽略 start")
                 return
             if not self.steps:
                 self.get_logger().error("head_sweep.yaml 里没有 steps，拒绝启动")
                 return
-            if not self.adapter.wait_pose(3.0):
+            if not self.adapter.wait_pose(1.0):
                 self.get_logger().warn("未收到 /robot_state，按 0 姿态起步（确认 robot_control 已启动）")
             self._stop_evt.clear()
+            self._pause_evt.clear()
             self.adapter.stop_requested = False
-            self._worker = threading.Thread(target=self._sweep_loop,
-                                            name="head_sweep", daemon=True)
+            self._worker = threading.Thread(target=self._motion_loop,
+                                            name="head_motion", daemon=True)
             self._worker.start()
 
     def _request_stop(self, reason):
@@ -141,26 +230,76 @@ class HeadSweepServer(Node):
         self.get_logger().warn(f"停止扫视：{reason}")
         self._publish("stopping")
 
-    def _sweep_loop(self):
-        self._publish("sweeping")
-        while not self._stop_evt.is_set():
-            for idx, step in enumerate(self.steps, 1):
-                if self._stop_evt.is_set():
-                    break
-                pose = [float(v) for v in step["pose"]]
-                name = step.get("name", "")
-                self._publish(f"step:{idx}:{name}")
-                self.adapter.move_to(pose, self.duration, 0.0,
-                                     self.speed, self.current)
-                if self._stop_evt.wait(self.dwell):
-                    break
-        # 回中后再收尾，避免头歪着停在半路
+    # ---------- 运动线程（唯一向 /head/cmd 发指令的线程） ----------
+    def _motion_loop(self):
+        try:
+            while not self._stop_evt.is_set():
+                mode = self._mode
+                if mode == "look":
+                    self._run_look()
+                elif mode == "sweep":
+                    if self._pause_evt.is_set():
+                        self._hold_current("paused")
+                    else:
+                        self._run_step()
+                else:
+                    time.sleep(self.period)
+        finally:
+            self._finish()
+
+    def _run_step(self):
+        step = self.steps[self._step_idx]
+        pose = [float(v) for v in step["pose"]]
+        name = step.get("name", "")
+        want = f"step:{self._step_idx + 1}:{name}"
+        if self._state != want:
+            self._publish(want)
         self.adapter.stop_requested = False
-        self.adapter.move_to([0.0, 0.0, 0.0], 1.5, 0.2,
+        # 停留期间 move_to 持续下发，防止第三方发布者抢走 /head/cmd
+        self.adapter.move_to(pose, self.duration, self.dwell,
                              self.speed, self.current)
-        self._publish("stopped" if self._stop_evt.is_set() else "idle")
+        if self._stop_evt.is_set() or self._pause_evt.is_set():
+            return
+        self._step_idx = (self._step_idx + 1) % len(self.steps)
+
+    def _run_look(self):
+        target = list(self._look_target)
+        if self._state != "looking":
+            self._publish("looking")
+        self.adapter.stop_requested = False
+        self.adapter.move_to(target, self.look_duration, 0.0,
+                             self.speed, self.current)
+        if self._stop_evt.is_set() or self._mode != "look":
+            return
+        if self._state != "holding":
+            self._publish("holding")
+        # 保持到 resume / center / stop：既看得住目标，也压住第三方发布者
+        while not self._stop_evt.is_set() and self._mode == "look":
+            self.adapter.send(target, self.speed, self.current)
+            time.sleep(self.period)
+
+    def _hold_current(self, state):
+        if self._state != state:
+            self._publish(state)
+        while (not self._stop_evt.is_set() and self._mode == "sweep"
+               and self._pause_evt.is_set()):
+            self.adapter.send(self.adapter.last_cmd, self.speed, self.current)
+            time.sleep(self.period)
+
+    def _finish(self):
+        self._pause_evt.clear()
+        self.adapter.stop_requested = False
+        # 回中后再收尾，避免头歪着停在半路
+        self.adapter.move_to([0.0, 0.0, 0.0], self.center_duration, 0.2,
+                             self.speed, self.current)
+        self._publish("stopped")
+
+    # ---------- 状态上报 ----------
+    def _publish_state(self):
+        self._publish(self._state)
 
     def _publish(self, state):
+        self._state = state
         if not rclpy.ok():
             return
         msg = String()
@@ -171,7 +310,7 @@ class HeadSweepServer(Node):
     def shutdown_sweep(self):
         self._request_stop("服务退出")
         if self._worker is not None:
-            self._worker.join(timeout=5.0)
+            self._worker.join(timeout=8.0)
 
 
 def main(argv=None):

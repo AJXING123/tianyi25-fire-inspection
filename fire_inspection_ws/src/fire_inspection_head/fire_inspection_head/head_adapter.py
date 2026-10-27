@@ -49,6 +49,8 @@ class HeadAdapter:
         self.pub = node.create_publisher(HeadCtrl, cmd_topic, 10)
         node.create_subscription(RobotState, state_topic, self._on_state, 10)
         self.pose = [0.0, 0.0, 0.0]
+        # 最近一次下发的目标姿态，暂停时用它保持位置
+        self.last_cmd = [0.0, 0.0, 0.0]
         self._pose_ready = threading.Event()
         # 置 True 后 move_to 立即中断，用于手柄急停
         self.stop_requested = False
@@ -89,9 +91,11 @@ class HeadAdapter:
         return msg
 
     def send(self, positions, speed, current):
+        positions = [clamp(j, p) for j, p in zip(HEAD_JOINTS, positions)]
+        self.last_cmd = positions
         if self.dry_run:
             self._log.info(
-                f"[dry_run] /head/cmd -> {[round(clamp(j, p), 3) for j, p in zip(HEAD_JOINTS, positions)]}")
+                f"[dry_run] /head/cmd -> {[round(p, 3) for p in positions]}")
             return
         self.pub.publish(self.build(positions, speed, current))
 

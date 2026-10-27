@@ -7,7 +7,7 @@
     ros2 launch fire_inspection_nav navigate_to.launch.py
     ros2 launch fire_inspection_nav navigate_to.launch.py config_file:=/path/to/pois.yaml
 
-当前仅支持 dry_run:=true（只读校验，不下发运动指令）。
+dry_run:=true 只做只读校验；dry_run:=false 走实机轨道运动（需已重定位）。
 """
 
 from launch import LaunchDescription
@@ -24,7 +24,7 @@ def generate_launch_description() -> LaunchDescription:
         DeclareLaunchArgument(
             "dry_run",
             default_value="true",
-            description="true=只读校验，不下发运动指令；实机运动尚未实现",
+            description="true=只读校验；false=实机运动（需已重定位，有人守护）",
         ),
     ]
 

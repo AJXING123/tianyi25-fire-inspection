@@ -10,17 +10,26 @@
 - **构建**：colcon（`ament_cmake` + `ament_python`）
 - **语言**：Python 3（`rclpy`）
 
-> ⚠️ **当前阶段：导航 dry_run、视觉检查、头部扫视已实现；语音与编排层为骨架**
+> ⚠️ **当前阶段：导航（dry_run + 实机运动）、视觉检查、头部扫视已实现；语音与编排层为骨架**
 >
 > | 模块 | 状态 |
 > | --- | --- |
-> | `fire_inspection_nav` | ✅ dry_run 只读链路（POI/轨道/定位校验、顺序管控、取消、并发互斥、超时参数、返回起点） |
+> | `fire_inspection_nav` | ✅ dry_run 只读链路 + 实机轨道运动（AEB、到点转向、限速备份回滚、取消、超时、返回起点） |
 > | `fire_inspection_vision` | ✅ InspectPoi 服务端（头部相机取图 + YOLO 推理 + 判定，无模型/无图/超时绝不判正常） |
 > | `fire_inspection_head` | ✅ 头部扫视服务端（`/fire_inspection/head_sweep_cmd` 控制、手柄急停、systemd 自启） |
 > | `fire_inspection_voice` | ⬜ 骨架，未注册 Action、不调 TTS |
 > | `fire_inspection_orchestrator` | ⬜ 骨架，未实现状态机 |
 >
-> **实机运动尚未实现**：`dry_run:=false` 时导航 goal 会直接返回失败并说明原因。
+> **实机运动已实现**：起点与过点点位（`POI_04`）走点对点，巡检段沿 `tracks.outbound`，
+> 返程沿 `tracks.return`；轨道到点后原地转向到点位朝向（`POI_03` 以地图中的 -60° 为准），
+> 校验实际朝向，偏差超过 0.10 rad 重试一次；若轨道末航点朝向已一致则不补转。
+> 每个巡检点位转向完成后停留 `dwell_s`（默认 5s），`dwell_overrides` 可按点位覆盖
+> （`POI_01`/`POI_02` 停 5s、`POI_04` 停 3s），起点与返程不停留。
+> 注意：底盘固件会忽略 `move_to_locations` 的 `target_position.yaw`，且跨全图的点对点返程会规划失败，因此返程必须走轨道。
+> 每段运动前开 AEB、轮询动作状态到终态，成功/失败/取消都会停车并关 AEB。
+> 实机模式启动时严格校验定位（`slam_status != 0` 直接拒绝所有 goal）与底盘健康（A 类故障直接拒绝并输出 DTC），
+> 每段运动前按 `speed.outbound_mps` / `speed.return_mps`（默认均为 0.4 m/s）下发限速，
+> 首次写入前备份底盘原值，节点退出时恢复。
 > 导航服务端只使用底盘 SDK，不初始化 `robot_controller` 门面，避免连带拉起手臂 / 手部 / 相机。
 > dry_run 下定位状态异常（`slam_status != 0`）只告警不拒绝，因为不下发运动；实机模式必须严格通过。
 
@@ -202,19 +211,20 @@ sudo systemctl enable --now head-sweep.service
 ros2 launch fire_inspection_nav navigate_to.launch.py
 
 # 终端 2：按顺序发 goal
-ros2 action send_goal /inspection/navigate_to fire_inspection_interfaces/action/NavigateTo "{poi: 'start_point'}" --feedback
-ros2 action send_goal /inspection/navigate_to fire_inspection_interfaces/action/NavigateTo "{poi: 'POI_01'}"
-ros2 action send_goal /inspection/navigate_to fire_inspection_interfaces/action/NavigateTo "{poi: 'POI_02'}"
-ros2 action send_goal /inspection/navigate_to fire_inspection_interfaces/action/NavigateTo "{poi: 'POI_03'}"
+ros2 action send_goal /fire_inspection/navigate_to fire_inspection_interfaces/action/NavigateTo "{poi: 'start_point'}" --feedback
+ros2 action send_goal /fire_inspection/navigate_to fire_inspection_interfaces/action/NavigateTo "{poi: 'POI_01'}"
+ros2 action send_goal /fire_inspection/navigate_to fire_inspection_interfaces/action/NavigateTo "{poi: 'POI_02'}"
+ros2 action send_goal /fire_inspection/navigate_to fire_inspection_interfaces/action/NavigateTo "{poi: 'POI_03'}"
 # 返回起点：is_return 必须为 true，且 poi 固定为 start_point
-ros2 action send_goal /inspection/navigate_to fire_inspection_interfaces/action/NavigateTo "{poi: 'start_point', is_return: true}"
+ros2 action send_goal /fire_inspection/navigate_to fire_inspection_interfaces/action/NavigateTo "{poi: 'start_point', is_return: true}"
 ```
 
 预期行为：
 - 顺序不对（如重复请求 `POI_01`）会返回 `success: false`，提示"点位顺序不匹配"；
 - `is_return: true` 只用于"返回起点"：`poi` 非 `start_poi` 会被拒绝；未开始巡检时不能返回；
   已在起点时重复返回会被拒绝；中途返回后，下一个正常 goal 从原进度继续，不重走已完成点位；
-- 首个 `start_point` 走点对点，其余段（含返回起点）走唯一轨道；
+- 首个 `start_point` 与 `POI_04`（`transit_pois`）走点对点，巡检段走 `tracks.outbound`，
+  返程走 `tracks.return`（专门从 POI_04 回起点），到点后转为起点朝向；
 - `timeout_s` 传 0 或缺省时：`is_return: true` 用 `per_poi_s`，首次前往起点用 `to_start_s`，
   其余用 `per_poi_s`（返程不再借用 `to_start_s`）；
 - 配置自检：`start_poi` 不得出现在 `poi_order`，`poi_order` 不得有重复项，
@@ -236,13 +246,49 @@ ros2 action send_goal /inspection/navigate_to fire_inspection_interfaces/action/
 - `message` 会带进度快照（已开始 / 已返回 / 已完成数 / 下一站），仅作人类可读说明；
 - 结果里 `[dry_run]` 前缀表示未下发任何运动指令。
 
+### 5.2 实机运动
+
+```bash
+# 前置：完成重定位，确认 slam_status=0（curl 或底盘工具查询）
+curl -s http://192.168.11.10:9090/api/core/slam/v1/localization/status
+
+# 一键跑一轮（默认实机）
+/home/nvidia/fire-inspection/run_nav.sh
+
+# 只校验不动车
+/home/nvidia/fire-inspection/run_nav.sh --dry-run
+```
+
+实机行为：
+- 启动时定位异常（`slam_status != 0`）直接拒绝所有 goal，等重定位后无需重启节点（后台每 5s 重试）；
+- 每段运动前读取并备份底盘限速，按 `speed.outbound_mps`（巡检）/ `speed.return_mps`（返程，
+  默认均为 0.4 m/s）写入并回读确认；与当前值相同则不重复写；写入/验证失败立即回滚并终止；
+  节点退出时恢复原值；
+- 每段运动前开 AEB，轮询 `action_id` 状态到终态；失败/超时/取消都会先取消动作、停车再关 AEB；
+- 轨道段用 `move_to_locations_poi` 沿 `outbound`（巡检）或 `return`（返程）轨道到点，
+  再 `move_to(x, y, yaw, flags=0)` 原地转向；固件会忽略 `target_position.yaw`，这一步不能省；
+  若到点朝向已与点位朝向误差 ≤0.10 rad（轨道末航点朝向已对齐），则跳过补转；
+- 转向后回读位姿校验朝向，误差超过 0.10 rad 自动重试一次，仍超限则 goal 失败；
+- 到点后校验实际位置与 POI 的偏差，超过 `arrival_tolerance_m`（默认 0.5m）则 goal 失败，
+  避免固件报成功但车停在别处；
+- 点位朝向以底盘地图为唯一真源（`POI_03` 为地图中的 -60° / -1.0472 rad），本地不再覆盖；
+  前置校验会告警"轨道航点朝向 vs 点位朝向"不一致：想让车到点即朝向规定角度，
+  需在图中把对应轨道末端航点朝向改成点位朝向（不依赖到点补转）；
+- 每个点位到点后按 `_dwell_for` 停留：起点与返程 0s；`dwell_overrides` 优先
+  （`POI_04` 为 3s）；未单独配置的 `transit_pois` 0s；其余巡检点位 `dwell_s`（默认 5s）；
+  停留期间可被取消；
+- 返程沿 `tracks.return`（POI_04 → 起点）返回，到点后同样转向到起点朝向；
+  跨全图的点对点返程在底盘上会规划失败，不要使用。
+
+> ⚠️ 实机调试必须有人守护、急停可达、轨道无障碍；首次测试建议保持 0.4 m/s 以下。
+
 ---
 
 ## 6. 配置真源
 
 | 文件 | 内容 | 唯一真源约束 |
 | --- | --- | --- |
-| `fire_inspection_nav/config/pois.yaml` | 点位顺序、超时、应用层软限位 | 坐标以底盘 POI 服务端为准，**禁止写第二份坐标** |
+| `fire_inspection_nav/config/pois.yaml` | 点位顺序、巡检/返程轨道名、过点点位、停留时间、分段限速、超时、应用层软限位 | 坐标与朝向以底盘 POI 服务端为准，**禁止写第二份坐标/朝向** |
 | `fire_inspection_voice/config/voice.yaml` | TTS 服务名、`audio_id`、完成判定时序 | 完成判定只认 `status == "playing"` |
 | `fire_inspection_vision/config/vision.yaml` | 相机、模型路径、置信度、超时 | 模型路径留空即视为 `NO_MODEL` |
 | `fire_inspection_head/config/head_sweep.yaml` | 扫视序列、节奏、发布频率、手柄急停键 | 改参数需重启节点，不用重编译 |

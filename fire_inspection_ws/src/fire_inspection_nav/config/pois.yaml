@@ -10,10 +10,40 @@ poi_order:
   - POI_01
   - POI_02
   - POI_03
+  - POI_04
+
+# 轨道按名称指定：巡检段用 outbound，返程用 return（从 POI_04 到起点）
+tracks:
+  outbound: track_line_1000
+  return: track_line_1001
+
+# 只过点、不走巡检轨道的点位（POI_04 是返程轨道上轨点）
+# 默认不停留，可用下面的 dwell_overrides 单独指定停留时间
+transit_pois:
+  - POI_04
 
 timeouts:
   to_start_s: 180.0
   per_poi_s: 180.0
+
+# 每个巡检点位到点后的停留时间（秒），起点、过点点位与返程不停留
+dwell_s: 5.0
+
+# 单点停留时间覆盖（优先级高于 dwell_s / transit_pois 的不停留默认）
+# 巡检点只留短暂稳定时间，视觉检查由编排层在到点后触发
+dwell_overrides:
+  POI_01: 1.0
+  POI_02: 1.0
+  POI_03: 1.0
+  POI_04: 3.0
+
+# 分段限速（m/s）：巡检段与返程段分别下发，节点退出时恢复底盘原值
+speed:
+  outbound_mps: 0.4
+  return_mps: 0.4
+
+# 到点位置容差（米）：实际位姿与 POI 偏差超过该值则本次 goal 失败
+arrival_tolerance_m: 0.5
 
 # 应用层软限位（超出即拒绝 goal），与现场物理护栏配合使用
 # 现网消防地图实测范围约为 x 2.9~26.6、y 1.3~2.5，此处留足余量，
