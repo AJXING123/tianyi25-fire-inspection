@@ -28,3 +28,32 @@ pois:
   - name: POI_03
     expect_classes: []
     abnormal_classes: [smoking, fire]
+
+# 检测 -> 头部锁定 -> 播报 -> 恢复 这条链路（orchestrator 唯一指挥）
+scan:
+  topic: /fire_inspection/detection
+  head_cmd_topic: /fire_inspection/head_sweep_cmd
+  head_status_topic: /fire_inspection/head_status
+  robot_state_topic: /robot_state
+  speak_action: /fire_inspection/speak
+
+  # 触发类别：只要看到就停下来看 + 播报；安全出口标志常驻画面，默认不触发
+  classes: [smoking, fire_extinguisher]
+  abnormal_classes: [smoking]
+
+  confirm_frames: 3        # 连续 N 帧同类才触发，防误报
+  cooldown_s: 15.0         # 同一类触发后的冷却时间
+
+  # 像素 -> 关节角换算（非冻结，现场可调）
+  fov_h_deg: 80.0
+  fov_v_deg: 60.0
+  fov_gain: 0.8
+
+  speak_enabled: true      # Speak Action 未部署时可置 false 只看日志
+  speak_timeout_s: 15.0
+  speech_abnormal: "警告，检测到{cn}，请及时处理"
+  speech_normal: "发现{cn}"
+  cls_cn:
+    smoking: 吸烟行为
+    fire_extinguisher: 灭火器
+    safety_sign: 安全出口标志
