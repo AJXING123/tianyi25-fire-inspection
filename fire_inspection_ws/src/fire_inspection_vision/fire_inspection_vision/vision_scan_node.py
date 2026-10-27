@@ -1,20 +1,27 @@
-"""消防巡检常驻扫描节点：持续订阅相机 -> 推理 -> 发布检测结果。
+"""T3 持续检测节点：订阅头部相机帧，持续推理并发 /fire_inspection/detection。
 
-话题：/fire_inspection/detection  fire_inspection_interfaces/msg/PoiResult
-  QoS：best_effort / depth 1（只要最新结果，允许丢帧）
-  detections_json 按契约 §6.1：cls/conf/cx/cy/w/h（归一化，按 conf 降序，最多 20 条）
-  status：0 无检出 / 1 有检出；simulated=true 时 detections_json 恒为 []
+为编排层（orchestrator）提供实时检测流，使其能够基于「连续 N 帧同类命中」
+做防误报确认，并在第一次命中时就锁定头部转向目标。
 
-设计要点：
-- 推理在独立线程里跑，不阻塞订阅回调；
-- 只处理「最新一帧」，不排队，避免积压导致结果延迟；
-- 两次推理之间按 scan_rate_hz 限速，避免长时间占满 GPU。
+与 InspectPoi Action 的关系：
+  - InspectPoi 是「单次点名检测」，供 orchestrator 在 NAV_TO_POI → INSPECT 阶段调用
+  - vision_scan_node 是「持续检测流」，供 orchestrator 在 WATCH 阶段实时响应
+
+配置来自 config/vision.yaml 的 scan 段：
+  topic: /fire_inspection/detection   发布话题（契约 T3，best_effort / depth 1）
+  rate_hz: 2.0                        推理限速，太低漏目标，太高占满 GPU
+
+发布：fire_inspection_interfaces/msg/PoiResult
+  poi: "scan"                         持续检测固定标记为 scan
+  status: 0-6                         NORMAL/ABNORMAL/UNCERTAIN/...
+  simulated: true = dry_run           编排层对 simulated=true 的结果一律忽略
+  detections_json: cx/cy/w/h 归一化   契约 §6.1 schema，conf 降序最多 20 条
 """
 
 from __future__ import annotations
 
 import os
-import threading
+import time
 
 import cv2
 import numpy as np
@@ -25,11 +32,11 @@ from rclpy.node import Node
 from rclpy.qos import (DurabilityPolicy, HistoryPolicy, QoSProfile,
                        ReliabilityPolicy)
 from sensor_msgs.msg import CompressedImage
+from std_msgs.msg import Header
 
 from fire_inspection_interfaces.msg import PoiResult
-from fire_inspection_vision.detect_core import (STATUS_ABNORMAL, STATUS_NO_FRAME,
-                                               STATUS_NORMAL, Detector,
-                                               canonical)
+from fire_inspection_vision.detect_core import (Detector, STATUS_NO_FRAME,
+                                                 STATUS_NO_MODEL, STATUS_ERROR)
 
 
 def load_config():
@@ -39,7 +46,8 @@ def load_config():
         return yaml.safe_load(f) or {}
 
 
-def sensor_qos():
+def detection_qos():
+    """契约 T3：best_effort / depth 1，编排层订阅端必须一致。"""
     return QoSProfile(
         reliability=ReliabilityPolicy.BEST_EFFORT,
         history=HistoryPolicy.KEEP_LAST,
@@ -52,106 +60,92 @@ class VisionScanNode(Node):
     def __init__(self):
         super().__init__("vision_scan")
         cfg = load_config()
-        scan = cfg.get("scan") or {}
 
         self.declare_parameter("dry_run", bool(cfg.get("dry_run", False)))
         self.dry_run = bool(self.get_parameter("dry_run").value)
 
-        topic = cfg.get("topic", "/ob_camera_head/color/image_raw/compressed")
-        out_topic = scan.get("topic", "/fire_inspection/detection")
-        self.rate = max(0.2, float(scan.get("rate_hz", 2.0)))
-        self.interval = 1.0 / self.rate
-        self.infer_timeout = float((cfg.get("timeouts") or {}).get(
-            "inference_timeout_s", 5.0))
-
+        # 模型 / 阈值
+        self.model_path = str(cfg.get("model_path", ""))
         th = cfg.get("thresholds") or {}
         self.detector = Detector(
-            model_path=cfg.get("model_path", ""),
+            model_path=self.model_path,
             imgsz=int(cfg.get("imgsz", 1280)),
             conf_smoking=float(th.get("conf_smoking", 0.25)),
             conf_other=float(th.get("conf_other", 0.65)),
             device=str(cfg.get("device", "0")),
         )
 
-        self._pub = self.create_publisher(PoiResult, out_topic, sensor_qos())
-        self.create_subscription(CompressedImage, topic, self._on_image,
-                                 sensor_qos())
+        # 相机
+        cam_topic = str(cfg.get("topic", "/ob_camera_head/color/image_raw/compressed"))
+        self._latest_frame = None
+        self._frame_lock = __import__("threading").Lock()
 
-        self._frame = None
-        self._seq = 0
-        self._lock = threading.Lock()
-        self._new_frame = threading.Event()
-        self._stop = threading.Event()
-        self._worker = threading.Thread(target=self._loop, name="scan_infer",
-                                        daemon=True)
-        self._worker.start()
+        # T3 发布
+        scan = cfg.get("scan") or {}
+        scan_topic = str(scan.get("topic", "/fire_inspection/detection"))
+        self.rate_hz = float(scan.get("rate_hz", 2.0))
+        self._period = 1.0 / max(0.5, self.rate_hz)
+        self._pub = self.create_publisher(PoiResult, scan_topic, detection_qos())
+
+        # 订阅相机（best_effort / depth 1，只留最新帧）
+        self.create_subscription(CompressedImage, cam_topic,
+                                 self._on_frame, detection_qos())
+
+        # 定时推理
+        self._timer = self.create_timer(self._period, self._scan_once)
 
         self.get_logger().info(
-            f"常驻扫描就绪 相机={topic} 发布={out_topic} "
-            f"{self.rate:.1f}Hz dry_run={self.dry_run}")
+            f"持续检测节点就绪 topic={scan_topic} rate={self.rate_hz:.1f}Hz "
+            f"相机={cam_topic} dry_run={self.dry_run} model={self.model_path}")
 
-    # ---------- 相机 ----------
-    def _on_image(self, msg):
-        frame = cv2.imdecode(np.frombuffer(msg.data, np.uint8),
-                             cv2.IMREAD_COLOR)
-        if frame is None:
+    # ---------- 相机帧 ----------
+    def _on_frame(self, msg):
+        try:
+            buf = np.frombuffer(msg.data, np.uint8)
+            img = cv2.imdecode(buf, cv2.IMREAD_COLOR)
+        except Exception:
             return
-        with self._lock:
-            self._frame = frame
-            self._seq += 1
-        self._new_frame.set()
+        if img is None:
+            return
+        with self._frame_lock:
+            self._latest_frame = img
 
-    # ---------- 推理线程 ----------
-    def _loop(self):
-        while rclpy.ok() and not self._stop.is_set():
-            if not self._new_frame.wait(0.5):
-                continue
-            self._new_frame.clear()
+    # ---------- 单次推理 ----------
+    def _scan_once(self):
+        frame = None
+        with self._frame_lock:
+            frame = self._latest_frame
+        if frame is None:
+            self._publish(STATUS_NO_FRAME, "无图像", "[]")
+            return
 
-            if self.dry_run:
-                self._publish(STATUS_NORMAL, True, "dry_run 未推理", "[]")
-                self._stop.wait(self.interval)
-                continue
+        if self.dry_run:
+            self._publish(2, "dry_run 模拟", "[]", simulated=True)
+            return
 
-            with self._lock:
-                frame = self._frame
-            if frame is None:
-                self._stop.wait(self.interval)
-                continue
+        dets, err, status = self.detector.infer(frame, timeout_s=5.0)
+        if dets is None:
+            self._publish(status or STATUS_ERROR, err or "推理失败", "[]")
+            return
 
-            dets, err, fail_status = self.detector.infer(frame, self.infer_timeout)
-            if dets is None:
-                status = fail_status if fail_status is not None else STATUS_NO_FRAME
-                self._publish(status, False, err or "推理失败", "[]")
-                self._stop.wait(self.interval)
-                continue
+        filtered = self.detector.filter(dets)
+        detections_json = Detector.to_json(filtered)
+        # 持续检测流不做判定（N/ABNORMAL/UNCERTAIN），只把检出列表交给编排层自己定夺
+        # 编排层 WATCH/LOCKED 状态下只关心"有没有命中过目标"
+        self._publish(2 if not filtered else 0,
+                      f"检出 {len(filtered)} 个目标" if filtered else "无检出",
+                      detections_json)
 
-            kept = self.detector.filter(dets)
-            names = sorted({canonical(d["cls"]) for d in kept})
-            if kept:
-                detail = "检出: " + ", ".join(names)
-                status = STATUS_ABNORMAL
-            else:
-                detail = "无检出"
-                status = STATUS_NORMAL
-            self._publish(status, False, detail, self.detector.to_json(kept))
-            self._stop.wait(self.interval)
-
-    def _publish(self, status, simulated, detail, dets_json):
+    def _publish(self, status, detail, detections_json, simulated=None):
         msg = PoiResult()
+        msg.header = Header()
         msg.header.stamp = self.get_clock().now().to_msg()
-        msg.header.frame_id = "head"
         msg.poi = "scan"
         msg.status = int(status)
-        msg.simulated = bool(simulated)
-        msg.detail = detail
-        msg.detections_json = dets_json
+        msg.detail = str(detail)
+        msg.detections_json = str(detections_json)
+        msg.simulated = bool(self.dry_run if simulated is None else simulated)
         self._pub.publish(msg)
-
-    def shutdown(self):
-        self._stop.set()
-        self._new_frame.set()
-        self._worker.join(timeout=3.0)
 
 
 def main(argv=None):
@@ -162,7 +156,6 @@ def main(argv=None):
     except KeyboardInterrupt:
         pass
     finally:
-        node.shutdown()
         node.destroy_node()
         if rclpy.ok():
             rclpy.shutdown()

@@ -20,9 +20,11 @@ timeouts:
   inference_timeout_s: 5.0
 
 # 每个点位的检查目标由 orchestrator 在 goal 中下发，此处只给默认值
+# 类名必须是模型真实类别（smoking / safety_sign / fire_extinguisher）；
+# 写 fire 会被别名映射成 fire_extinguisher，语义与本意（烟火）不符，禁止使用。
 defaults:
   expect_classes: []
-  abnormal_classes: [smoking, fire]
+  abnormal_classes: [smoking]
 
 # 常驻扫描节点（vision_scan_node）：持续推理并发 /fire_inspection/detection
 dry_run: false

@@ -45,6 +45,17 @@ speed:
 # 到点位置容差（米）：实际位姿与 POI 偏差超过该值则本次 goal 失败
 arrival_tolerance_m: 0.5
 
+# 自动重定位：仅在实机模式（dry_run:=false）且定位异常时触发，
+# dry_run 下永不调用底盘重定位接口。
+# 初始位姿默认取 start_poi 的 x/y/yaw（开机时车应停在起点）；
+# 确需覆盖时取消下面 pose 的注释。max_time_ms 可选，透传给底盘。
+relocalize:
+  enabled: true           # 一键脚本实机运行时会自动重定位；仍异常则拒绝导航
+  timeout_s: 60.0         # 轮询 slam_status 的硬上限，超时即拒绝导航
+  poll_interval_s: 0.5
+  # max_time_ms: 60000
+  # pose: {x: 0.0, y: 0.0, yaw: 0.0}
+
 # 应用层软限位（超出即拒绝 goal），与现场物理护栏配合使用
 # 现网消防地图实测范围约为 x 2.9~26.6、y 1.3~2.5，此处留足余量，
 # 用于拦截数量级写错的坐标，而不是精确复刻现场边界。

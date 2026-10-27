@@ -1,59 +1,38 @@
 # 消防巡检流程配置 —— 编排层唯一真源
-version: "0.1"
-approved_version: "0.1"
+version: "0.2"
+approved_version: "0.2"
 
 start_poi: start_point
-return_to_start: false
-dwell_s: 3.0
+return_to_start: true
 
-# 各阶段播报文案；null 表示该阶段不播报
-speech:
-  start: "消防巡检开始，前往起点"
-  arrive: "已到达{name}，开始检查"
-  normal: "{name}检查正常"
-  abnormal: "警告，{name}发现异常"
-  uncertain: "{name}检查结果不确定，请人工复核"
-  nav_failed: "前往{name}失败，巡检终止"
-  done: "全部点位巡检完成"
-  cancelled: "巡检已取消"
+# 到点后头部回中完成后的稳定等待（秒）
+settle_s: 1.0
+# 视觉取帧超时（秒），透传给 InspectPoi.timeout_s
+inspect_timeout_s: 5.0
 
-# 点位检查项（坐标以底盘 POI 服务端为准，此处只写检查语义）
+# 全局阈值映射 —— 与视觉层 vision.yaml 单一来源，禁止自行漂移：
+#   smoking 0.25 放宽阈值优先保证检出；其他类 0.65 收紧压制误检
+conf_by_class:
+  smoking: 0.25
+  safety_sign: 0.65
+  fire_extinguisher: 0.65
+
+# 巡检点：expect 全部检出=正常，任一缺失=不确定；abnormal 命中=异常；
+# focus_classes 是调用方显式指定的"本检查点专用目标类别"（如专查安全指示牌），
+# 为空时沿用通用文案，绝不按 POI 名称猜测专用目标。
 pois:
   - name: POI_01
-    expect_classes: []
-    abnormal_classes: [smoking, fire]
+    expect_classes: [fire_extinguisher, safety_sign]
+    abnormal_classes: [smoking]
+    focus_classes: []   # 待现场确认是否专查某类；当前留空走通用文案
   - name: POI_02
-    expect_classes: []
-    abnormal_classes: [smoking, fire]
+    expect_classes: [safety_sign]
+    abnormal_classes: [smoking]
+    focus_classes: []   # 待现场确认
   - name: POI_03
-    expect_classes: []
-    abnormal_classes: [smoking, fire]
+    expect_classes: [safety_sign]
+    abnormal_classes: [smoking]
+    focus_classes: []   # 待现场确认
 
-# 检测 -> 头部锁定 -> 播报 -> 恢复 这条链路（orchestrator 唯一指挥）
-scan:
-  topic: /fire_inspection/detection
-  head_cmd_topic: /fire_inspection/head_sweep_cmd
-  head_status_topic: /fire_inspection/head_status
-  robot_state_topic: /robot_state
-  speak_action: /fire_inspection/speak
-
-  # 触发类别：只要看到就停下来看 + 播报；安全出口标志常驻画面，默认不触发
-  classes: [smoking, fire_extinguisher]
-  abnormal_classes: [smoking]
-
-  confirm_frames: 3        # 连续 N 帧同类才触发，防误报
-  cooldown_s: 15.0         # 同一类触发后的冷却时间
-
-  # 像素 -> 关节角换算（非冻结，现场可调）
-  fov_h_deg: 80.0
-  fov_v_deg: 60.0
-  fov_gain: 0.8
-
-  speak_enabled: true      # Speak Action 未部署时可置 false 只看日志
-  speak_timeout_s: 15.0
-  speech_abnormal: "警告，检测到{cn}，请及时处理"
-  speech_normal: "发现{cn}"
-  cls_cn:
-    smoking: 吸烟行为
-    fire_extinguisher: 灭火器
-    safety_sign: 安全出口标志
+# 只经过、不做视觉检查的点位（POI_04 后沿返程轨道回起点）
+transit_pois: [POI_04]

@@ -63,6 +63,14 @@ _TERMINAL_FAIL = {
     "cancelled", "canceled", "stopped", "aborted", "rejected",
 }
 
+# 只有这些定位状态的异常才主动下发重定位：
+# 1=丢失 / 2=精度下降 / 3=异常 / 5=等待重定位；
+# 6=重定位中、7=加载地图、8=等待传感器属于底盘正在恢复，重复下发只会互相打断
+_RELOCALIZE_TRIGGER_STATUS = frozenset({1, 2, 3, 5})
+
+# 轨道段出发前朝向对齐的容差：小于该角度不再原地补转
+_TRAVEL_ALIGN_TOLERANCE_RAD = 0.15
+
 
 def _classify_action_status(st) -> str:
     """把底盘动作状态分类为 success / failure / running。"""
@@ -183,6 +191,59 @@ class NavigateToServer(Node):
         if not self._poi_order:
             raise RuntimeError(f"配置缺少 poi_order: {self._config_path}")
 
+        # 自动重定位：仅实机模式生效，dry_run 永不触发
+        reloc_cfg = config.get("relocalize") or {}
+        if not isinstance(reloc_cfg, dict):
+            raise RuntimeError("relocalize 必须是映射")
+        unknown_reloc_keys = set(reloc_cfg) - {
+            "enabled", "timeout_s", "poll_interval_s", "max_time_ms", "pose"
+        }
+        if unknown_reloc_keys:
+            raise RuntimeError(f"relocalize 存在未知键: {sorted(unknown_reloc_keys)}")
+        self._relocalize_enabled = bool(reloc_cfg.get("enabled", False))
+        self._relocalize_timeout_s = float(reloc_cfg.get("timeout_s", 60.0))
+        if (
+            not math.isfinite(self._relocalize_timeout_s)
+            or not 0 < self._relocalize_timeout_s <= 600
+        ):
+            raise RuntimeError(
+                f"relocalize.timeout_s 非法: {self._relocalize_timeout_s}"
+                f"（应在 (0, 600]）"
+            )
+        self._relocalize_poll_s = float(reloc_cfg.get("poll_interval_s", 0.5))
+        if (
+            not math.isfinite(self._relocalize_poll_s)
+            or not 0.05 <= self._relocalize_poll_s <= 5.0
+        ):
+            raise RuntimeError(
+                f"relocalize.poll_interval_s 非法: {self._relocalize_poll_s}"
+                f"（应在 [0.05, 5.0]）"
+            )
+        self._relocalize_max_time_ms = reloc_cfg.get("max_time_ms")
+        if self._relocalize_max_time_ms is not None:
+            self._relocalize_max_time_ms = int(self._relocalize_max_time_ms)
+            if self._relocalize_max_time_ms <= 0:
+                raise RuntimeError(
+                    f"relocalize.max_time_ms 非法: {self._relocalize_max_time_ms}"
+                )
+        self._relocalize_pose_override = None
+        pose_cfg = reloc_cfg.get("pose")
+        if pose_cfg is not None:
+            if not isinstance(pose_cfg, dict):
+                raise RuntimeError("relocalize.pose 必须是 {x, y, yaw}")
+            missing_pose = [k for k in ("x", "y", "yaw") if pose_cfg.get(k) is None]
+            if missing_pose:
+                raise RuntimeError(f"relocalize.pose 缺少字段: {missing_pose}")
+            self._relocalize_pose_override = {
+                k: float(pose_cfg[k]) for k in ("x", "y", "yaw")
+            }
+            for key, value in self._relocalize_pose_override.items():
+                if not math.isfinite(value):
+                    raise RuntimeError(f"relocalize.pose.{key} 非法: {value}")
+            yaw = self._relocalize_pose_override["yaw"]
+            if not -math.pi <= yaw <= math.pi:
+                raise RuntimeError(f"relocalize.pose.yaw 非法: {yaw}")
+
         self._chassis = KnewbotChassisNav(
             host=str(self.get_parameter("host").value),
             rest_port=int(self.get_parameter("rest_port").value),
@@ -211,6 +272,9 @@ class NavigateToServer(Node):
         self._track_id = None
         self._track_name = None
         self._return_track_id = None
+        # 轨道航点缓存：用于轨道段出发前把车头对齐到行进方向
+        self._outbound_waypoints = []
+        self._return_waypoints = []
         self._preflight()
         self._last_preflight_at = time.monotonic()
 
@@ -316,8 +380,10 @@ class NavigateToServer(Node):
                 raise RuntimeError("outbound 轨道缺少 track_id")
             self._track_id = outbound["track_id"]
             self._track_name = outbound.get("track_name") or str(self._track_id)
+            self._outbound_waypoints = list(outbound.get("waypoints") or [])
 
             self._return_track_id = None
+            self._return_waypoints = []
             if self._return_track_name:
                 return_track = by_name.get(self._return_track_name)
                 if return_track is None:
@@ -328,6 +394,7 @@ class NavigateToServer(Node):
                 if return_track.get("track_id") is None:
                     raise RuntimeError("return 轨道缺少 track_id")
                 self._return_track_id = return_track["track_id"]
+                self._return_waypoints = list(return_track.get("waypoints") or [])
                 self._check_return_track(return_track)
 
             self._check_poi_on_track(
@@ -339,7 +406,8 @@ class NavigateToServer(Node):
                 self._track_name,
             )
 
-            # dry_run 不下发运动，定位异常只告警；实机模式必须严格通过
+            # dry_run 不下发运动，定位异常只告警；实机模式定位异常会先尝试
+            # 自动重定位（relocalize.enabled），仍不可用才拒绝
             self._check_localization(strict=not self._dry_run)
             if not self._dry_run:
                 self._check_health()
@@ -541,15 +609,88 @@ class NavigateToServer(Node):
         rv = self._chassis.get_localization_status() or {}
         return rv.get("slam_status") if isinstance(rv, dict) else None
 
-    def _check_localization(self, strict: bool) -> None:
-        """定位校验。dry_run 只警告，因为不下发运动；实机模式必须严格通过。"""
+    def _check_localization(self, strict: bool, goal_handle=None) -> str:
+        """定位校验；实机模式下定位异常时尝试一次自动重定位。
+
+        - dry_run / 未启用 relocalize：保持原语义，只告警或直接拒绝；
+        - 实机 + 已启用：仅 slam_status ∈ {1,2,3,5} 才下发重定位，
+          以 ``start_poi`` 位姿（或配置覆盖值）恢复，轮询到 0；
+          底盘自身正在恢复（6/7/8）时不插手，直接拒绝本次导航；
+        - goal 执行期间允许取消，返回 ``cancelled`` 由调用方收尾。
+        """
         slam_status = self._read_slam_status()
         if slam_status == 0:
-            return
+            return "ok"
         message = f"定位状态异常 slam_status={slam_status}（需为 0）"
-        if strict:
-            raise RuntimeError(message)
-        self.get_logger().warn(f"{message}；dry_run 不下发运动，仅记录为风险")
+        if not (strict and self._relocalize_enabled and not self._dry_run):
+            if strict:
+                raise RuntimeError(message)
+            self.get_logger().warn(f"{message}；dry_run 不下发运动，仅记录为风险")
+            return "ok"
+        if slam_status not in _RELOCALIZE_TRIGGER_STATUS:
+            raise RuntimeError(
+                f"{message}；该状态不在自动重定位范围"
+                f"{sorted(_RELOCALIZE_TRIGGER_STATUS)}（底盘可能正在恢复/加载地图），"
+                f"本次导航拒绝"
+            )
+
+        self.get_logger().warn(f"{message}，尝试自动重定位")
+        outcome = self._relocalize(goal_handle)
+        if outcome == "cancelled":
+            return "cancelled"
+        self.get_logger().info("重定位成功，定位状态已恢复")
+        return "ok"
+
+    def _relocalize_pose(self) -> dict:
+        """重定位初始位姿：优先配置覆盖值，否则用起点的 x/y/yaw。"""
+        if self._relocalize_pose_override is not None:
+            return dict(self._relocalize_pose_override)
+        poi = self._pois.get(self._start_poi)
+        if not isinstance(poi, dict) or any(poi.get(k) is None for k in ("x", "y", "yaw")):
+            raise RuntimeError(
+                f"重定位缺少初始位姿：请配置 relocalize.pose，"
+                f"或确保已读到起点 {self._start_poi} 的 x/y/yaw"
+            )
+        return {"x": float(poi["x"]), "y": float(poi["y"]), "yaw": float(poi["yaw"])}
+
+    def _relocalize(self, goal_handle=None) -> str:
+        """下发重定位并轮询到恢复；失败抛异常，取消返回 ``cancelled``。"""
+        pose = self._relocalize_pose()
+        self.get_logger().info(
+            f"下发重定位：x={pose['x']:.3f}，y={pose['y']:.3f}，"
+            f"yaw={pose['yaw']:.3f}，超时={self._relocalize_timeout_s:.1f}s"
+        )
+        try:
+            rv = self._chassis.recover_localization(
+                pose["x"],
+                pose["y"],
+                pose["yaw"],
+                max_time_ms=self._relocalize_max_time_ms,
+            )
+        except Exception as exc:  # noqa: BLE001 - 统一转成可读拒绝原因
+            raise RuntimeError(f"重定位下发失败：{exc}") from exc
+        action_id = rv.get("action_id") if isinstance(rv, dict) else None
+        if action_id is None:
+            self.get_logger().warn(f"重定位未返回 action_id（{rv!r}），仅轮询定位状态")
+        else:
+            self.get_logger().info(f"重定位动作已下发：action_id={action_id}")
+
+        deadline = time.monotonic() + self._relocalize_timeout_s
+        while time.monotonic() < deadline:
+            if self._shutting_down:
+                raise RuntimeError("节点关闭中，重定位中止")
+            if goal_handle is not None and goal_handle.is_cancel_requested:
+                self._cancel_action()
+                return "cancelled"
+            if self._read_slam_status() == 0:
+                return "ok"
+            time.sleep(
+                min(self._relocalize_poll_s, max(0.0, deadline - time.monotonic()))
+            )
+        raise RuntimeError(
+            f"重定位超时（{self._relocalize_timeout_s:.1f}s），"
+            f"slam_status={self._read_slam_status()}"
+        )
 
     def _check_health(self) -> None:
         """底盘健康校验：存在 A 类故障时拒绝运动，并给出 DTC 描述与处理建议。"""
@@ -793,10 +934,11 @@ class NavigateToServer(Node):
     # 实机运动
     # ------------------------------------------------------------------
     def _execute_real(self, goal_handle, poi, is_return, mode, timeout_s):
-        """实机运动：下发底盘动作 → 轮询到终态 → 到点转向 → 返回结果。"""
+        """实机运动：出发朝向对齐 → 下发底盘动作 → 轮询到终态 → 到点转向。"""
         result = NavigateTo.Result()
         result.is_return = is_return
-        self._check_localization(strict=True)
+        if self._check_localization(strict=True, goal_handle=goal_handle) == "cancelled":
+            return self._cancelled(goal_handle, result, poi)
         self._check_health()
         # 巡检段与返程段分别下发限速（配置相同则不会重复写底盘参数）
         if is_return:
@@ -814,17 +956,29 @@ class NavigateToServer(Node):
                     raise RuntimeError("未配置返程轨道 tracks.return")
                 motion_mode = "track"
                 active_track = self._return_track_name
-                rv = self._chassis.move_to_locations_poi(
-                    self._return_track_id, poi, uptrack_enabled=True
-                )
             elif mode == "point":
                 motion_mode = "point"
                 active_track = self._track_name
-                rv = self._chassis.move_to_poi(poi)
             else:
                 # 固件会忽略 target_position.yaw，轨道段只能先沿轨道到点再原地转向
                 motion_mode = "track"
                 active_track = self._track_name
+
+            # 轨道段不会自动把车头转到行进方向，先原地对齐，
+            # 否则车会保持点位朝向沿轨道横着平移（如 POI_02→POI_03 差 90°）
+            if motion_mode == "track":
+                if self._align_travel_direction(
+                    goal_handle, poi, is_return, deadline, timeout_s
+                ) == "cancelled":
+                    return self._cancelled(goal_handle, result, poi)
+
+            if is_return:
+                rv = self._chassis.move_to_locations_poi(
+                    self._return_track_id, poi, uptrack_enabled=True
+                )
+            elif mode == "point":
+                rv = self._chassis.move_to_poi(poi)
+            else:
                 rv = self._chassis.move_to_locations_poi(
                     self._track_id, poi, uptrack_enabled=True
                 )
@@ -918,6 +1072,144 @@ class NavigateToServer(Node):
                     f"最后状态={st!r}"
                 )
             time.sleep(self._action_poll_interval_s)
+
+    def _track_departure_yaw(self, is_return, pose):
+        """计算当前轨道段的行进朝向；无法确定时返回 None。
+
+        优先取所在航点的第一个控制点（曲线段），没有控制点时取下一个
+        位置不同的航点（直线段）。同一坐标可能同时存在"到达航点"和
+        "出发航点"，取靠后的那个。
+        """
+        waypoints = self._return_waypoints if is_return else self._outbound_waypoints
+        if not waypoints or not isinstance(pose, dict):
+            return None
+        try:
+            px, py = float(pose["x"]), float(pose["y"])
+        except (KeyError, TypeError, ValueError):
+            return None
+
+        index, best = None, 1.0
+        for i, waypoint in enumerate(waypoints):
+            position = waypoint.get("position") if isinstance(waypoint, dict) else None
+            if (
+                not isinstance(position, dict)
+                or position.get("x") is None
+                or position.get("y") is None
+            ):
+                continue
+            distance = math.hypot(
+                px - float(position["x"]), py - float(position["y"])
+            )
+            if distance <= best:
+                index, best = i, distance
+        if index is None:
+            return None
+
+        waypoint = waypoints[index]
+        position = waypoint["position"]
+        ahead = None
+        for point in waypoint.get("control_points") or []:
+            if (
+                isinstance(point, dict)
+                and point.get("x") is not None
+                and point.get("y") is not None
+            ):
+                ahead = (float(point["x"]), float(point["y"]))
+                break
+        if ahead is None:
+            for later in waypoints[index + 1:]:
+                point = later.get("position") if isinstance(later, dict) else None
+                if (
+                    not isinstance(point, dict)
+                    or point.get("x") is None
+                    or point.get("y") is None
+                ):
+                    continue
+                if math.hypot(
+                    float(point["x"]) - float(position["x"]),
+                    float(point["y"]) - float(position["y"]),
+                ) <= 0.05:
+                    continue
+                ahead = (float(point["x"]), float(point["y"]))
+                break
+        if ahead is None:
+            return None
+
+        dx = ahead[0] - float(position["x"])
+        dy = ahead[1] - float(position["y"])
+        if math.hypot(dx, dy) < 0.05:
+            return None
+        return math.atan2(dy, dx)
+
+    def _align_travel_direction(
+        self, goal_handle, poi, is_return, deadline, timeout_s
+    ) -> str:
+        """轨道段出发前原地转向到行进方向，避免车头未朝前导致横着平移。
+
+        对齐失败只告警不阻断导航；取消请求返回 cancelled。
+        """
+        pose = self._read_pose()
+        target_yaw = self._track_departure_yaw(is_return, pose)
+        if target_yaw is None:
+            self.get_logger().info(
+                f"{poi} 未能确定轨道出发方向，跳过出发朝向对齐"
+            )
+            return "ok"
+        try:
+            x, y = float(pose["x"]), float(pose["y"])
+            actual = float(pose["yaw"])
+        except (KeyError, TypeError, ValueError):
+            self.get_logger().warn(
+                f"{poi} 位姿缺少 x/y/yaw，跳过出发朝向对齐：{pose!r}"
+            )
+            return "ok"
+
+        error = abs(math.atan2(
+            math.sin(target_yaw - actual), math.cos(target_yaw - actual)
+        ))
+        if error <= _TRAVEL_ALIGN_TOLERANCE_RAD:
+            self.get_logger().info(
+                f"{poi} 出发朝向已对齐：目标={target_yaw:.3f}rad，"
+                f"实际={actual:.3f}rad，误差={error:.3f}rad"
+            )
+            return "ok"
+
+        self.get_logger().info(
+            f"{poi} 出发前朝向对齐：目标={target_yaw:.3f}rad，"
+            f"实际={actual:.3f}rad，误差={error:.3f}rad，原地转向"
+        )
+        rv = self._chassis.move_to(x, y, target_yaw, flags=0)
+        action_id = rv.get("action_id") if isinstance(rv, dict) else None
+        if action_id is None:
+            self.get_logger().warn(
+                f"{poi} 出发朝向对齐未返回 action_id：{rv!r}，继续沿轨道运动"
+            )
+            return "ok"
+        if self._run_chassis_action(
+            goal_handle, action_id, poi, "track", deadline, timeout_s
+        ) == "cancelled":
+            return "cancelled"
+
+        pose = self._read_pose()
+        try:
+            actual = float(pose["yaw"])
+        except (KeyError, TypeError, ValueError):
+            self.get_logger().warn(f"{poi} 对齐后无法读取朝向：{pose!r}")
+            return "ok"
+        error = abs(math.atan2(
+            math.sin(target_yaw - actual), math.cos(target_yaw - actual)
+        ))
+        if error > _TRAVEL_ALIGN_TOLERANCE_RAD:
+            self.get_logger().warn(
+                f"{poi} 出发朝向对齐后误差 {error:.3f}rad 超过 "
+                f"{_TRAVEL_ALIGN_TOLERANCE_RAD:.2f}，继续沿轨道运动"
+            )
+        else:
+            self.get_logger().info(
+                f"{poi} 出发朝向对齐完成：目标={target_yaw:.3f}rad，"
+                f"实际={actual:.3f}rad，误差={error:.3f}rad"
+            )
+        return "ok"
 
     def _rotate_to(self, goal_handle, poi, target, target_yaw,
                    deadline, timeout_s) -> str:

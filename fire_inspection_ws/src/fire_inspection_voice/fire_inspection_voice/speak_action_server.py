@@ -13,11 +13,19 @@
 
 🔴 执行回调里会阻塞轮询，必须 ReentrantCallbackGroup + MultiThreadedExecutor，
    否则 cancel 和其它回调无法被处理。
+
+语义约定（2026-10-27 第二批定点修订，均不改动冻结接口）：
+- query_timeout_s 是播放查询硬上限，文本估算兜底不得突破该上限；
+- 从未观测到 playing / 查询超时 → success=False, state='timeout'
+  （无法确认播报完成，不声称 TTS 一定失败）；成功完成才 success=True, state='done'；
+- 同一时间只允许一个语音 Goal：并发 Goal 在受理与执行两处都会被拒绝；
+- 主动取消走 ROS Action 取消终态（canceled），并真正 stop 音频。
 """
 
 from __future__ import annotations
 
 import os
+import threading
 import time
 
 import rclpy
@@ -65,6 +73,9 @@ class SpeakActionServer(Node):
 
         self.cli = self.create_client(TtsService, self.tts)
         self.group = ReentrantCallbackGroup()
+        # 并发 Goal 互斥：_on_goal 快速拒绝 + _execute 原子保护（acquire 失败
+        # 直接拒绝；无论正常结束、取消还是异常，finally 必然释放）
+        self._exec_lock = threading.Lock()
         self.server = ActionServer(
             self, Speak, "/fire_inspection/speak",
             execute_callback=self._execute,
@@ -81,12 +92,29 @@ class SpeakActionServer(Node):
         if not goal_request.text.strip():
             self.get_logger().warn("拒绝空文本的播报目标")
             return GoalResponse.REJECT
+        # G6: 已有 Goal 执行中则快速拒绝（权威保护仍在 _execute 的
+        # acquire(blocking=False)，此处只是受理阶段的快速路径）
+        if self._exec_lock.locked():
+            self.get_logger().warn("已有语音 Goal 执行中，拒绝新 Goal")
+            return GoalResponse.REJECT
         return GoalResponse.ACCEPT
 
     def _on_cancel(self, _goal_handle) -> CancelResponse:
         return CancelResponse.ACCEPT
 
     def _execute(self, goal_handle) -> Speak.Result:
+        # 并发保护：同一时间只允许一个语音 Goal 执行；拒绝并发 Goal。
+        # 无论正常结束、取消、超时还是异常，finally 都会释放锁。
+        if not self._exec_lock.acquire(blocking=False):
+            self.get_logger().warn("已有语音 Goal 执行中，拒绝并发 Goal")
+            goal_handle.abort()
+            return self._result(False, "已有语音 Goal 执行中", "rejected")
+        try:
+            return self._execute_locked(goal_handle)
+        finally:
+            self._exec_lock.release()
+
+    def _execute_locked(self, goal_handle) -> Speak.Result:
         req = goal_handle.request
         text = req.text.strip()
 
@@ -116,7 +144,9 @@ class SpeakActionServer(Node):
             return self._result(False, "TTS append 未成功", "rejected")
 
         est = max(self.min_duration, len(text) * self.s_per_char)
-        hard = est * 2.0 + 5.0
+        # G1: query_timeout_s 是播放查询硬上限，文本估算兜底不得突破该上限
+        hard = min(est * 2.0 + 5.0, self.timeout)
+        est_deadline = min(est + 1.0, self.timeout)
         t0 = time.monotonic()
         seen_playing = False
         idle_since = None
@@ -144,13 +174,20 @@ class SpeakActionServer(Node):
 
             done = (seen_playing and idle_since is not None
                     and elapsed - idle_since >= self.settle)
-            if not done and not seen_playing and elapsed >= est + 1.0:
-                done = True
+            if not done and not seen_playing and elapsed >= est_deadline:
+                # 从未观测到 playing：无法确认播报完成（不声称 TTS 一定失败，
+                # 可能瞬播完/被抢占/未合成），不得伪装为成功
+                msg = (f"无法确认播报完成（从未观测到播放状态，"
+                       f"已等待 {elapsed:.1f}s）")
+                self.get_logger().warn(msg)
+                goal_handle.abort()
+                return self._result(False, msg, "timeout")
             if not done and elapsed >= hard:
-                self.get_logger().warn(f"播报超过兜底上限 {hard:.1f}s，强制结束")
-                goal_handle.succeed()
-                return self._result(True, f"播报超时强制结束（{elapsed:.1f}s）",
-                                    "timeout")
+                # 播放查询超时 → success=False, state="timeout"
+                msg = f"播放查询超时（超过 {hard:.1f}s 上限）"
+                self.get_logger().warn(msg)
+                goal_handle.abort()
+                return self._result(False, msg, "timeout")
             if done:
                 break
 
@@ -200,7 +237,12 @@ class SpeakActionServer(Node):
             return None
 
     def _stop_tts(self):
-        resp = self._call("stop", "", self.audio_id)
+        # stop 是 best-effort：调用异常不得中断播报主流程
+        try:
+            resp = self._call("stop", "", self.audio_id)
+        except Exception as exc:
+            self.get_logger().warn(f"TTS stop 调用异常: {exc}")
+            return
         if resp is None:
             self.get_logger().warn(f"TTS stop(audio_id={self.audio_id}) 无应答")
         elif not resp.success:
@@ -225,3 +267,4 @@ def main(argv=None) -> None:
 
 if __name__ == "__main__":
     main()
+
