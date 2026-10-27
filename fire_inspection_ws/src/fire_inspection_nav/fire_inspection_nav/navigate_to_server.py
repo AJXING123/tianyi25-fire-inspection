@@ -1,10 +1,10 @@
 """消防巡检导航服务端。
 
-当前实现范围：**dry_run 只读链路**。
-- 启动时通过底盘 REST 读取 POI 表、轨道信息、定位状态，做前置校验；
-- 收到 NavigateTo goal 时重新读取定位状态，然后模拟到点并返回结果；
-- **dry_run 不下发任何运动指令，也不写限速参数**；
-- 实机运动（轨道导航 + 转向 yaw）尚未实现，goal 会返回失败并说明原因。
+实现范围：
+- 启动时通过底盘 REST 读取 POI 表、轨道信息、定位状态与底盘健康，做前置校验；
+- `dry_run:=true`：只读校验 + 模拟到点，不下发任何运动指令，也不写限速；
+- `dry_run:=false`：实机运动（首点点对点、后续沿轨道、到点按 POI yaw 转向），
+  含 AEB、动作状态轮询、取消/超时、限速备份与回滚、定位与健康严格校验。
 
 只使用底盘 SDK（KnewbotChassisNav），不初始化 robot_controller 门面，
 避免 dry_run 阶段连带拉起手臂 / 手部 / 相机等与导航无关的硬件。
@@ -54,6 +54,33 @@ def _unwrap_list(rv, *keys):
     return []
 
 
+# 底盘动作终态判定（兼容不同固件返回的字段与措辞，与 run_POI.py 保持一致）
+_TERMINAL_SUCCESS = {
+    "successed", "succeeded", "success", "finished", "done", "completed",
+}
+_TERMINAL_FAIL = {
+    "failed", "failure", "error",
+    "cancelled", "canceled", "stopped", "aborted", "rejected",
+}
+
+
+def _classify_action_status(st) -> str:
+    """把底盘动作状态分类为 success / failure / running。"""
+    if not isinstance(st, dict):
+        return "running"
+    if st.get("done") is True or st.get("is_finished") is True:
+        return "success"
+    for key in ("status", "state", "action_state"):
+        val = st.get(key)
+        if isinstance(val, str):
+            v = val.lower()
+            if v in _TERMINAL_SUCCESS:
+                return "success"
+            if v in _TERMINAL_FAIL:
+                return "failure"
+    return "running"
+
+
 def _describe(rv) -> str:
     """给 REST 原始返回一个简短描述，避免结构不符被误读成"没有数据"。"""
     if isinstance(rv, dict):
@@ -74,12 +101,25 @@ class NavigateToServer(Node):
         self.declare_parameter("dry_run", True)
         self.declare_parameter("dry_run_delay_s", 0.5)
         self.declare_parameter("preflight_retry_interval_s", 5.0)
+        self.declare_parameter("max_speed_mps", 0.4)
+        self.declare_parameter("speed_apply_timeout_s", 5.0)
+        self.declare_parameter("action_poll_interval_s", 0.5)
 
         self._dry_run = bool(self.get_parameter("dry_run").value)
         self._dry_run_delay_s = float(self.get_parameter("dry_run_delay_s").value)
         self._preflight_retry_interval_s = float(
             self.get_parameter("preflight_retry_interval_s").value
         )
+        self._max_speed_mps = float(self.get_parameter("max_speed_mps").value)
+        self._speed_apply_timeout_s = float(
+            self.get_parameter("speed_apply_timeout_s").value
+        )
+        self._action_poll_interval_s = float(
+            self.get_parameter("action_poll_interval_s").value
+        )
+        # 限速原值备份：写入前读取，退出/失败必须回滚，禁止猜默认值
+        self._speed_backup = None
+        self._speed_limit_applied = False
 
         config = self._load_config()
         self._start_poi = str(config.get("start_poi", "start_point"))
@@ -89,6 +129,57 @@ class NavigateToServer(Node):
         self._start_timeout_s = float(timeouts.get("to_start_s", 180.0))
         self._poi_source = str(config.get("poi_source", "chassis"))
         self._range_limit = config.get("range_limit") or {}
+        self._dwell_s = float(config.get("dwell_s", 5.0))
+        self._yaw_overrides = {
+            str(name): float(yaw)
+            for name, yaw in (config.get("yaw_overrides") or {}).items()
+        }
+        if not math.isfinite(self._dwell_s) or self._dwell_s < 0:
+            raise RuntimeError(f"dwell_s 非法: {self._dwell_s}")
+        self._dwell_overrides = {
+            str(name): float(sec)
+            for name, sec in (config.get("dwell_overrides") or {}).items()
+        }
+        for name, sec in self._dwell_overrides.items():
+            if not math.isfinite(sec) or sec < 0:
+                raise RuntimeError(f"dwell_overrides[{name}] 非法: {sec}")
+        for name, yaw in self._yaw_overrides.items():
+            if not math.isfinite(yaw) or not -math.pi <= yaw <= math.pi:
+                raise RuntimeError(f"yaw_overrides[{name}] 非法: {yaw}")
+        self._arrival_tolerance_m = float(config.get("arrival_tolerance_m", 0.5))
+        if (
+            not math.isfinite(self._arrival_tolerance_m)
+            or self._arrival_tolerance_m <= 0
+        ):
+            raise RuntimeError(f"arrival_tolerance_m 非法: {self._arrival_tolerance_m}")
+        speed_cfg = config.get("speed") or {}
+        if not isinstance(speed_cfg, dict):
+            raise RuntimeError("speed 必须是 {outbound_mps: 值, return_mps: 值}")
+        unknown_speed_keys = set(speed_cfg) - {"outbound_mps", "return_mps"}
+        if unknown_speed_keys:
+            raise RuntimeError(f"speed 存在未知键: {sorted(unknown_speed_keys)}")
+        self._outbound_speed = float(
+            speed_cfg.get("outbound_mps", self._max_speed_mps)
+        )
+        self._return_speed = float(speed_cfg.get("return_mps", self._max_speed_mps))
+        for label, value in (
+            ("outbound_mps", self._outbound_speed),
+            ("return_mps", self._return_speed),
+        ):
+            if not math.isfinite(value) or not 0 < value <= 1.5:
+                raise RuntimeError(f"speed.{label} 非法: {value}（应在 (0, 1.5]）")
+
+        tracks_cfg = config.get("tracks") or {}
+        if not isinstance(tracks_cfg, dict):
+            raise RuntimeError("tracks 必须是 {outbound: 名称, return: 名称}")
+        unknown_track_keys = set(tracks_cfg) - {"outbound", "return"}
+        if unknown_track_keys:
+            raise RuntimeError(f"tracks 存在未知键: {sorted(unknown_track_keys)}")
+        self._outbound_track_name = str(tracks_cfg.get("outbound") or "")
+        self._return_track_name = str(tracks_cfg.get("return") or "")
+        self._transit_pois = {
+            str(name) for name in (config.get("transit_pois") or [])
+        }
         if not self._poi_order:
             raise RuntimeError(f"配置缺少 poi_order: {self._config_path}")
 
@@ -119,6 +210,7 @@ class NavigateToServer(Node):
         self._pois_raw_desc = ""
         self._track_id = None
         self._track_name = None
+        self._return_track_id = None
         self._preflight()
         self._last_preflight_at = time.monotonic()
 
@@ -127,7 +219,7 @@ class NavigateToServer(Node):
         self._action_server = ActionServer(
             self,
             NavigateTo,
-            "/inspection/navigate_to",
+            "/fire_inspection/navigate_to",
             execute_callback=self._execute,
             goal_callback=self._on_goal,
             cancel_callback=self._on_cancel,
@@ -178,34 +270,85 @@ class NavigateToServer(Node):
             missing = [name for name in required if name not in self._pois]
             if missing:
                 raise RuntimeError(f"当前地图缺少 POI: {missing}")
+            unknown_yaw = sorted(
+                name for name in self._yaw_overrides if name not in self._pois
+            )
+            if unknown_yaw:
+                raise RuntimeError(f"yaw_overrides 引用了不存在的 POI: {unknown_yaw}")
             for name in required:
                 if any(self._pois[name].get(k) is None for k in ("x", "y", "yaw")):
                     raise RuntimeError(f"POI {name} 缺少 x/y/yaw")
             self._check_range_limit(required)
 
+            unknown_transit = sorted(self._transit_pois - set(self._poi_order))
+            if unknown_transit:
+                raise RuntimeError(
+                    f"transit_pois 必须属于 poi_order: {unknown_transit}"
+                )
+            unknown_dwell = sorted(set(self._dwell_overrides) - set(self._poi_order))
+            if unknown_dwell:
+                raise RuntimeError(
+                    f"dwell_overrides 引用了不在 poi_order 的点位: {unknown_dwell}"
+                )
             tracks_raw = self._read_tracks()
             tracks = [
                 t
                 for t in _unwrap_list(tracks_raw, "tracks", "track", "data")
                 if isinstance(t, dict)
             ]
-            if len(tracks) != 1:
-                names = [t.get("track_name") or t.get("track_id") for t in tracks]
+            by_name = {
+                str(t.get("track_name") or t.get("track_id")): t for t in tracks
+            }
+            if self._outbound_track_name:
+                outbound = by_name.get(self._outbound_track_name)
+                if outbound is None:
+                    raise RuntimeError(
+                        f"未找到 outbound 轨道 {self._outbound_track_name}，"
+                        f"当前: {sorted(by_name)}"
+                    )
+            elif len(tracks) == 1:
+                outbound = tracks[0]
+            else:
                 raise RuntimeError(
-                    f"当前地图应只有一条轨道，实际 {len(tracks)} 条: {names}"
-                    f"（接口返回 {_describe(tracks_raw)}）"
+                    f"存在多条轨道，必须在 tracks.outbound 指定，当前: {sorted(by_name)}"
                 )
-            if tracks[0].get("track_id") is None:
-                raise RuntimeError("轨道缺少 track_id")
-            self._track_id = tracks[0]["track_id"]
-            self._track_name = tracks[0].get("track_name") or str(self._track_id)
-            self._check_poi_on_track(required, tracks[0])
+            if outbound.get("track_id") is None:
+                raise RuntimeError("outbound 轨道缺少 track_id")
+            self._track_id = outbound["track_id"]
+            self._track_name = outbound.get("track_name") or str(self._track_id)
 
-            self._check_localization(strict=False)
+            self._return_track_id = None
+            if self._return_track_name:
+                return_track = by_name.get(self._return_track_name)
+                if return_track is None:
+                    raise RuntimeError(
+                        f"未找到 return 轨道 {self._return_track_name}，"
+                        f"当前: {sorted(by_name)}"
+                    )
+                if return_track.get("track_id") is None:
+                    raise RuntimeError("return 轨道缺少 track_id")
+                self._return_track_id = return_track["track_id"]
+                self._check_return_track(return_track)
+
+            self._check_poi_on_track(
+                [n for n in required if n not in self._transit_pois], outbound
+            )
+            self._warn_track_yaw_mismatch(
+                [n for n in required if n not in self._transit_pois],
+                outbound,
+                self._track_name,
+            )
+
+            # dry_run 不下发运动，定位异常只告警；实机模式必须严格通过
+            self._check_localization(strict=not self._dry_run)
+            if not self._dry_run:
+                self._check_health()
 
             self.get_logger().info(
                 f"前置校验通过：地图={self._map_name}，{len(self._pois)} 个 POI，"
-                f"轨道 {self._track_name} (track_id={self._track_id})"
+                f"巡检轨道 {self._track_name} (track_id={self._track_id})，"
+                f"返程轨道 {self._return_track_name or '未配置'} "
+                f"(track_id={self._return_track_id})"
             )
             self._preflight_error = None
         except Exception as exc:  # noqa: BLE001 - 校验失败需完整保留原因
@@ -244,6 +387,43 @@ class NavigateToServer(Node):
                         f"POI {name} 的 {axis}={value:.3f} 超出软限位 [{lo}, {hi}]"
                     )
 
+    def _check_return_track(self, track) -> None:
+        """返程轨道必须经过起点；上轨点与配置的过点点位不一致时告警。"""
+        waypoints = track.get("waypoints") if isinstance(track, dict) else None
+        if not isinstance(waypoints, list) or not waypoints:
+            raise RuntimeError("return 轨道没有航点数据")
+        points = []
+        for waypoint in waypoints:
+            position = waypoint.get("position") if isinstance(waypoint, dict) else None
+            if (
+                isinstance(position, dict)
+                and position.get("x") is not None
+                and position.get("y") is not None
+            ):
+                points.append((float(position["x"]), float(position["y"])))
+        if not points:
+            raise RuntimeError("return 轨道航点缺少坐标")
+        start = self._pois[self._start_poi]
+        sx, sy = float(start["x"]), float(start["y"])
+        nearest = min(math.hypot(sx - x, sy - y) for x, y in points)
+        if nearest > 0.2:
+            raise RuntimeError(
+                f"return 轨道不经过起点 {self._start_poi}（最近 {nearest:.2f}m）"
+            )
+        boarding = [name for name in self._poi_order if name in self._transit_pois]
+        if boarding:
+            poi = self._pois[boarding[-1]]
+            bx, by = float(poi["x"]), float(poi["y"])
+            first = min(math.hypot(bx - x, by - y) for x, y in points)
+            if first > 0.5:
+                self.get_logger().warn(
+                    f"return 轨道起点距 {boarding[-1]} {first:.2f}m（>0.5m），"
+                    f"请确认上轨点"
+                )
+        self._warn_track_yaw_mismatch(
+            [self._start_poi], track, self._return_track_name or "return"
+        )
+
     def _check_poi_on_track(self, names, track) -> None:
         """告警级校验：POI 是否与轨道航点位置吻合。
 
@@ -271,6 +451,43 @@ class NavigateToServer(Node):
                 self.get_logger().warn(
                     f"POI {name} 距最近轨道航点 {nearest:.2f}m（>0.5m），"
                     f"请确认该点位在轨道可达范围内"
+                )
+
+    def _warn_track_yaw_mismatch(self, names, track, track_label) -> None:
+        """轨道航点朝向与点位朝向不一致时告警。
+
+        固件会忽略 move_to_locations 的目标 yaw，轨道到点后只能原地转向；
+        若把轨道末端航点朝向改成点位朝向，机器人到点即为规定角度。
+        """
+        waypoints = track.get("waypoints") if isinstance(track, dict) else None
+        if not isinstance(waypoints, list) or not waypoints:
+            return
+        for name in names:
+            poi = self._pois[name]
+            px, py = float(poi["x"]), float(poi["y"])
+            nearest, best = None, float("inf")
+            for waypoint in waypoints:
+                position = waypoint.get("position") if isinstance(waypoint, dict) else None
+                if not isinstance(position, dict):
+                    continue
+                if position.get("x") is None or position.get("y") is None:
+                    continue
+                d = math.hypot(px - float(position["x"]), py - float(position["y"]))
+                # 同一坐标可能同时有"到达航点"和"转向航点"，取靠后的那个（实际到达朝向）
+                if d <= best:
+                    nearest, best = position, d
+            if nearest is None or best > 0.5 or nearest.get("yaw") is None:
+                continue
+            waypoint_yaw = float(nearest["yaw"])
+            poi_yaw = self._yaw_overrides.get(name, float(poi["yaw"]))
+            error = abs(math.atan2(
+                math.sin(poi_yaw - waypoint_yaw), math.cos(poi_yaw - waypoint_yaw)
+            ))
+            if error > 0.2:
+                self.get_logger().warn(
+                    f"{track_label} 在 {name} 处航点朝向={waypoint_yaw:.3f}rad，"
+                    f"点位朝向={poi_yaw:.3f}rad，到点后会原地转向；"
+                    f"如需到点即朝向规定角度，请把该航点朝向改为 {poi_yaw:.3f}"
                 )
 
     def _ensure_preflight(self) -> None:
@@ -333,6 +550,20 @@ class NavigateToServer(Node):
         if strict:
             raise RuntimeError(message)
         self.get_logger().warn(f"{message}；dry_run 不下发运动，仅记录为风险")
+
+    def _check_health(self) -> None:
+        """底盘健康校验：存在 A 类故障时拒绝运动，并给出 DTC 描述与处理建议。"""
+        health = self._chassis.get_robot_health()
+        if not (
+            getattr(health, "hasFatal", False) or getattr(health, "hasError", False)
+        ):
+            return
+        details = "；".join(
+            f"0x{entry.id:08X} {entry.description}"
+            f"（处理：{entry.solution}）"
+            for entry in getattr(health, "baseError", [])
+        ) or "未返回 DTC 详情"
+        raise RuntimeError(f"底盘健康检查未通过：{details}")
 
     # ------------------------------------------------------------------
     # 顺序管理
@@ -509,13 +740,16 @@ class NavigateToServer(Node):
             f"（dry_run={self._dry_run}）"
         )
 
+        # 起点与过点点位走点对点，巡检点沿巡检轨道，返程沿返程轨道
+        if is_return:
+            mode = "track"
+        elif poi == self._start_poi or poi in self._transit_pois:
+            mode = "point"
+        else:
+            mode = "track"
+
         if not self._dry_run:
-            return self._fail(
-                goal_handle,
-                result,
-                "实机运动尚未实现：当前仅支持 dry_run 只读链路，请设置 dry_run:=true",
-                "error",
-            )
+            return self._execute_real(goal_handle, poi, is_return, mode, timeout_s)
 
         if goal_handle.is_cancel_requested:
             return self._cancelled(goal_handle, result, poi)
@@ -525,10 +759,6 @@ class NavigateToServer(Node):
         except Exception as exc:  # noqa: BLE001
             return self._fail(goal_handle, result, f"读取定位状态失败：{exc}", "error")
 
-        # 首次去起点用点对点，其余段（含返回起点）都沿轨道
-        mode = "track" if is_return else (
-            "point" if (poi == self._start_poi and not self._started) else "track"
-        )
         pose = self._read_pose()
         if not isinstance(pose, dict):
             self.get_logger().warn(f"读取当前位姿失败：{pose}")
@@ -546,15 +776,348 @@ class NavigateToServer(Node):
         result.phase = "arrived"
         result.is_return = is_return
         action = "返回起点" if is_return else "前往"
+        track_desc = "点对点"
+        if mode == "track":
+            track_desc = self._return_track_name if is_return else self._track_name
         result.message = (
             f"[dry_run] {action} {poi} 校验通过，未下发运动指令；"
-            f"方式={mode}，轨道={self._track_name}，当前位姿={pose}，"
+            f"方式={mode}，轨道={track_desc}，当前位姿={pose}，"
             f"距目标={distance_m:.2f}m；{self._progress()}"
         )
         self._publish_feedback(goal_handle, "arrived", mode, 0.0)
         self.get_logger().info(result.message)
         goal_handle.succeed()
         return result
+
+    # ------------------------------------------------------------------
+    # 实机运动
+    # ------------------------------------------------------------------
+    def _execute_real(self, goal_handle, poi, is_return, mode, timeout_s):
+        """实机运动：下发底盘动作 → 轮询到终态 → 到点转向 → 返回结果。"""
+        result = NavigateTo.Result()
+        result.is_return = is_return
+        self._check_localization(strict=True)
+        self._check_health()
+        # 巡检段与返程段分别下发限速（配置相同则不会重复写底盘参数）
+        if is_return:
+            self._apply_speed(self._return_speed, "返程")
+        else:
+            self._apply_speed(self._outbound_speed, "巡检")
+        self._set_aeb(True)
+        deadline = time.monotonic() + timeout_s
+        try:
+            if goal_handle.is_cancel_requested or self._shutting_down:
+                return self._cancelled(goal_handle, result, poi)
+            target = self._pois[poi]
+            if is_return:
+                if self._return_track_id is None:
+                    raise RuntimeError("未配置返程轨道 tracks.return")
+                motion_mode = "track"
+                active_track = self._return_track_name
+                rv = self._chassis.move_to_locations_poi(
+                    self._return_track_id, poi, uptrack_enabled=True
+                )
+            elif mode == "point":
+                motion_mode = "point"
+                active_track = self._track_name
+                rv = self._chassis.move_to_poi(poi)
+            else:
+                # 固件会忽略 target_position.yaw，轨道段只能先沿轨道到点再原地转向
+                motion_mode = "track"
+                active_track = self._track_name
+                rv = self._chassis.move_to_locations_poi(
+                    self._track_id, poi, uptrack_enabled=True
+                )
+            action_id = rv.get("action_id") if isinstance(rv, dict) else None
+            if action_id is None:
+                raise RuntimeError(f"底盘未返回 action_id：{rv!r}")
+            self.get_logger().info(
+                f"实机运动已下发：poi={poi}，方式={motion_mode}，action_id={action_id}"
+            )
+            if self._run_chassis_action(
+                goal_handle, action_id, poi, motion_mode, deadline, timeout_s
+            ) == "cancelled":
+                return self._cancelled(goal_handle, result, poi)
+
+            # 轨道到达朝向与设定角度不同，到点后原地转向并校验实际朝向
+            if motion_mode == "track":
+                yaw = self._yaw_overrides.get(poi, float(target["yaw"]))
+                rotate = self._rotate_to(
+                    goal_handle, poi, target, yaw, deadline, timeout_s
+                )
+                if rotate == "cancelled":
+                    return self._cancelled(goal_handle, result, poi)
+
+            # 固件报成功不等于车到了巡检点：位置偏差过大直接判失败
+            self._check_arrival_position(poi)
+
+            # 到点停留（起点与返程不停留），供后续拍照/语音使用
+            dwell_s = self._dwell_for(poi)
+            if dwell_s > 0:
+                if not self._dwell(goal_handle, poi, deadline, dwell_s):
+                    return self._cancelled(goal_handle, result, poi)
+        finally:
+            # 无论成功 / 失败 / 取消，都先取消动作再关 AEB
+            self._cancel_action()
+            self._set_aeb(False)
+
+        with self._seq_lock:
+            self._advance(poi)
+
+        result.success = True
+        result.phase = "arrived"
+        action = "返回起点" if is_return else "前往"
+        track_desc = active_track if motion_mode == "track" else "点对点"
+        result.message = (
+            f"{action} {poi} 完成；方式={motion_mode}，轨道={track_desc}；"
+            f"{self._progress()}"
+        )
+        self._publish_feedback(goal_handle, "arrived", motion_mode, 0.0)
+        self.get_logger().info(result.message)
+        goal_handle.succeed()
+        return result
+
+    def _run_chassis_action(self, goal_handle, action_id, poi, mode, deadline, timeout_s):
+        """轮询底盘动作到终态。
+
+        返回 success / cancelled；失败或超时抛异常，由 _execute 统一 abort。
+        """
+        deadline = min(deadline, time.monotonic() + timeout_s)
+        last_log = 0.0
+        while True:
+            if self._shutting_down or goal_handle.is_cancel_requested:
+                self._cancel_and_settle(action_id)
+                return "cancelled"
+
+            try:
+                st = self._chassis.get_action_status(action_id)
+            except Exception as exc:  # noqa: BLE001 - 轮询抖动不立即终止
+                self.get_logger().warn(f"轮询动作状态异常（继续）：{exc}")
+                st = None
+
+            verdict = _classify_action_status(st)
+            if verdict == "success":
+                return "success"
+            if verdict == "failure":
+                raise RuntimeError(f"{poi} 实机运动执行失败：status={st!r}")
+
+            pose = self._read_pose()
+            distance_m = self._distance_to(poi, pose)
+            self._publish_feedback(goal_handle, "navigating", mode, distance_m)
+            now = time.monotonic()
+            if now - last_log >= 2.0:
+                last_log = now
+                self.get_logger().info(
+                    f"{poi} 运动进行中：距目标 {distance_m:.2f}m，"
+                    f"剩余超时 {max(0.0, deadline - now):.0f}s"
+                )
+            if now >= deadline:
+                self._cancel_and_settle(action_id)
+                raise RuntimeError(
+                    f"{poi} 导航超时（{timeout_s:.0f}s），已下发取消；"
+                    f"最后状态={st!r}"
+                )
+            time.sleep(self._action_poll_interval_s)
+
+    def _rotate_to(self, goal_handle, poi, target, target_yaw,
+                   deadline, timeout_s) -> str:
+        """到点原地转向到目标 yaw，并校验实际朝向；偏差过大重试一次。"""
+        pose = self._chassis.get_pose()
+        if isinstance(pose, dict) and pose.get("yaw") is not None:
+            actual = float(pose["yaw"])
+            error = abs(math.atan2(
+                math.sin(target_yaw - actual), math.cos(target_yaw - actual)
+            ))
+            if error <= 0.10:
+                # 轨道末航点朝向已与点位朝向一致，不再原地补转
+                self.get_logger().info(
+                    f"{poi} 到点朝向已符合：目标={target_yaw:.3f}rad，"
+                    f"实际={actual:.3f}rad，误差={error:.3f}rad，无需转向"
+                )
+                return "ok"
+        actual = None
+        for attempt in range(2):
+            rv = self._chassis.move_to(
+                float(target["x"]), float(target["y"]), target_yaw, flags=0
+            )
+            action_id = rv.get("action_id") if isinstance(rv, dict) else None
+            if action_id is None:
+                raise RuntimeError(f"转向动作未返回 action_id：{rv!r}")
+            if self._run_chassis_action(
+                goal_handle, action_id, poi, "track", deadline, timeout_s
+            ) == "cancelled":
+                return "cancelled"
+            pose = self._chassis.get_pose()
+            if not isinstance(pose, dict) or pose.get("yaw") is None:
+                raise RuntimeError(f"无法读取朝向用于校验：{pose!r}")
+            actual = float(pose["yaw"])
+            error = abs(math.atan2(
+                math.sin(target_yaw - actual), math.cos(target_yaw - actual)
+            ))
+            self.get_logger().info(
+                f"{poi} 到点朝向校验：目标={target_yaw:.3f}rad，"
+                f"实际={actual:.3f}rad，误差={error:.3f}rad"
+            )
+            if error <= 0.10:
+                return "ok"
+            if attempt == 0:
+                self.get_logger().warn(
+                    f"{poi} 朝向误差 {error:.3f}rad 超过 0.10，重试一次"
+                )
+        raise RuntimeError(
+            f"{poi} 朝向未到位：目标={target_yaw:.3f}rad，实际={actual:.3f}rad"
+        )
+
+    def _check_arrival_position(self, poi: str) -> None:
+        """到点位置校验：实际位置与 POI 偏差超过容差则判失败。
+
+        固件返回动作成功只代表动作走完，定位漂移或轨道提前结束时车可能停在别处，
+        仅校验朝向不足以证明巡检点到位。
+        """
+        target = self._pois[poi]
+        pose = self._chassis.get_pose()
+        if (
+            not isinstance(pose, dict)
+            or pose.get("x") is None
+            or pose.get("y") is None
+        ):
+            raise RuntimeError(f"{poi} 到点位置校验失败：无法读取位姿 {pose!r}")
+        error = math.hypot(
+            float(target["x"]) - float(pose["x"]),
+            float(target["y"]) - float(pose["y"]),
+        )
+        self.get_logger().info(
+            f"{poi} 到点位置校验：目标=({float(target['x']):.3f}, "
+            f"{float(target['y']):.3f})，实际=({float(pose['x']):.3f}, "
+            f"{float(pose['y']):.3f})，误差={error:.3f}m"
+        )
+        if error > self._arrival_tolerance_m:
+            raise RuntimeError(
+                f"{poi} 到点位置偏差 {error:.2f}m 超过容差 "
+                f"{self._arrival_tolerance_m:.2f}m"
+            )
+
+    def _dwell_for(self, poi: str) -> float:
+        """该点位到点后的停留时长。
+
+        起点不停留；`dwell_overrides` 优先；未单独配置的过点点位（transit_pois）不停留；
+        其余巡检点位用全局 `dwell_s`。
+        """
+        if poi == self._start_poi:
+            return 0.0
+        seconds = self._dwell_overrides.get(poi)
+        if seconds is not None:
+            return seconds
+        if poi in self._transit_pois:
+            return 0.0
+        return self._dwell_s
+
+    def _dwell(self, goal_handle, poi, deadline, seconds) -> bool:
+        """到点停留；返回 False 表示收到取消，由调用方返回 cancelled。"""
+        end = min(time.monotonic() + seconds, deadline)
+        self.get_logger().info(f"{poi} 到点停留 {seconds:.1f}s")
+        while time.monotonic() < end:
+            if self._shutting_down or goal_handle.is_cancel_requested:
+                return False
+            time.sleep(0.1)
+        if time.monotonic() >= deadline:
+            raise RuntimeError(f"{poi} 停留期间达到 goal 超时")
+        return True
+
+    def _cancel_and_settle(self, action_id=None):
+        """下发取消并短暂等待动作退出 running，避免带着运动关 AEB。"""
+        self._cancel_action(action_id)
+        settle_deadline = time.monotonic() + 2.0
+        while time.monotonic() < settle_deadline:
+            try:
+                st = self._chassis.get_action_status(action_id)
+            except Exception:  # noqa: BLE001 - 查询失败不再等待
+                break
+            if _classify_action_status(st) != "running":
+                break
+            time.sleep(0.2)
+        self._cancel_action()
+
+    def _cancel_action(self, action_id=None):
+        try:
+            self._chassis.cancel_action([action_id] if action_id else None)
+        except Exception as exc:  # noqa: BLE001 - 清理失败只告警
+            self.get_logger().warn(f"取消底盘动作失败：{exc}")
+
+    def _set_aeb(self, on: bool):
+        try:
+            self._chassis.set_aeb_control("On" if on else "Off")
+        except Exception as exc:  # noqa: BLE001 - AEB 失败不阻塞主流程
+            state = "开启" if on else "关闭"
+            self.get_logger().warn(f"AEB {state}失败（继续）：{exc}")
+
+    def _apply_speed(self, limit, label):
+        """按段写入限速；首次写入前备份原值，失败立即回滚。"""
+        if not self._speed_backup:
+            previous = self._chassis.get_speed_params() or {}
+            old_move = previous.get("max_moving_speed")
+            if old_move is None:
+                raise RuntimeError("读取底盘限速失败，无法备份原值，终止")
+            self._speed_backup = {
+                "max_moving_speed": old_move,
+                "max_angular_speed": previous.get("max_angular_speed"),
+            }
+            old_desc = f"{old_move} m/s"
+        else:
+            old_desc = f"{self._speed_backup['max_moving_speed']} m/s"
+        try:
+            current = (self._chassis.get_speed_params() or {}).get(
+                "max_moving_speed"
+            )
+            if current is None or abs(float(current) - limit) >= 1e-3:
+                self._chassis.set_speed_params(max_moving_speed=limit)
+            if not self._wait_speed(limit):
+                raise RuntimeError(
+                    f"限速 {limit} m/s 未在 {self._speed_apply_timeout_s}s 内生效"
+                )
+        except Exception:
+            self._restore_speed_limit()
+            raise
+        self._speed_limit_applied = True
+        self.get_logger().info(
+            f"{label}限速 {limit} m/s（底盘原值 {old_desc}）"
+        )
+
+    def _wait_speed(self, target) -> bool:
+        deadline = time.monotonic() + self._speed_apply_timeout_s
+        while time.monotonic() < deadline:
+            try:
+                current = (self._chassis.get_speed_params() or {}).get(
+                    "max_moving_speed"
+                )
+            except Exception:  # noqa: BLE001 - 单次读取失败继续重试
+                current = None
+            if current is not None and abs(float(current) - float(target)) < 1e-3:
+                return True
+            time.sleep(0.2)
+        return False
+
+    def _restore_speed_limit(self):
+        """恢复限速原值；成功后清空备份，失败保留以便关闭时再试。"""
+        backup = self._speed_backup
+        if not backup:
+            return
+        target = backup.get("max_moving_speed")
+        try:
+            self._chassis.set_speed_params(
+                max_moving_speed=target,
+                max_angular_speed=backup.get("max_angular_speed"),
+            )
+            if self._wait_speed(target):
+                self.get_logger().info(f"已恢复底盘限速 {target} m/s")
+                self._speed_limit_applied = False
+                self._speed_backup = None
+            else:
+                self.get_logger().error(
+                    f"底盘限速恢复未确认，目标 {target} m/s，请人工检查"
+                )
+        except Exception as exc:  # noqa: BLE001 - 回滚失败必须显式暴露
+            self.get_logger().error(f"恢复底盘限速失败：{exc}")
 
     def _cancelled(self, goal_handle, result, poi: str):
         result.success = False
@@ -610,6 +1173,9 @@ class NavigateToServer(Node):
             self._goal_lock.release()
         else:
             self.get_logger().warn("仍有 goal 未退出，直接关闭底盘会话")
+        # 退出前必须停车并回滚限速原值
+        self._cancel_action()
+        self._restore_speed_limit()
         try:
             self._chassis.close()
         except Exception:  # noqa: BLE001
