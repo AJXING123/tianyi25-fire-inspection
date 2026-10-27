@@ -36,6 +36,7 @@ from rclpy.qos import (DurabilityPolicy, HistoryPolicy, QoSProfile,
                        ReliabilityPolicy)
 from ros2_bridge_msgs.msg import RobotState
 from std_msgs.msg import String
+from fire_inspection_orchestrator.detection_validation import parse_detections
 
 from fire_inspection_interfaces.action import Speak
 from fire_inspection_interfaces.msg import PoiResult
@@ -148,9 +149,13 @@ class OrchestratorNode(Node):
             return
         if msg.simulated:
             return
-        try:
-            dets = json.loads(msg.detections_json) if msg.detections_json else []
-        except json.JSONDecodeError:
+        # 无效消息不能参与连续帧确认；清零连续命中状态，避免
+        # 两段不连续的有效检测被拼接成一次确认。
+        dets = parse_detections(msg.detections_json)
+        if dets is None:
+            self._streak = 0
+            self._streak_cls = ""
+            self.get_logger().warn("检测消息格式无效，已清除连续命中计数")
             return
 
         now = time.monotonic()
