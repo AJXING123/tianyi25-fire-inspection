@@ -1,6 +1,7 @@
 # 消防巡检语音配置
 tts_service: /intelligent_interaction/tts/play
 audio_id: audio_guide          # audio_config.json: priority=4, interruptible=true
+dry_run: false                 # true = 只打日志不出声
 
 timing:
   query_poll_s: 0.2
