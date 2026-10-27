@@ -25,6 +25,7 @@ setup(
     entry_points={
         "console_scripts": [
             "inspect_action_server = fire_inspection_vision.inspect_action_server:main",
+            "vision_scan_node = fire_inspection_vision.vision_scan_node:main",
         ],
     },
 )

@@ -31,4 +31,12 @@ def generate_launch_description() -> LaunchDescription:
         parameters=[{"dry_run": LaunchConfiguration("dry_run")}],
     )
 
-    return LaunchDescription(args + [inspect_action_server])
+    vision_scan_node = Node(
+        package="fire_inspection_vision",
+        executable="vision_scan_node",
+        name="vision_scan",
+        output="screen",
+        parameters=[{"dry_run": LaunchConfiguration("dry_run")}],
+    )
+
+    return LaunchDescription(args + [inspect_action_server, vision_scan_node])

@@ -117,14 +117,21 @@ class Detector:
             frame, imgsz=self.imgsz, conf=infer_conf,
             device=self.device, verbose=False,
         )[0]
+        h, w = frame.shape[:2]
         dets = []
         for box in result.boxes:
             cls_id = int(box.cls)
             name = self.names.get(cls_id, str(cls_id))
+            x1, y1, x2, y2 = [float(v) for v in box.xyxy[0]]
             dets.append({
                 "cls": name,
                 "conf": float(box.conf),
-                "xyxy": [int(v) for v in box.xyxy[0]],
+                # 归一化坐标（契约 §6.1）：cx/cy 为中心点，w/h 为宽高，均除以整幅画面
+                "cx": (x1 + x2) / 2.0 / w,
+                "cy": (y1 + y2) / 2.0 / h,
+                "w": (x2 - x1) / w,
+                "h": (y2 - y1) / h,
+                "xyxy": [int(x1), int(y1), int(x2), int(y2)],
             })
         return dets
 
@@ -159,9 +166,13 @@ class Detector:
         return STATUS_UNCERTAIN, "画面内无检出"
 
     @staticmethod
-    def to_json(dets):
+    def to_json(dets, limit=20):
+        """按契约 §6.1 序列化：cls/conf/cx/cy/w/h，按 conf 降序，最多 limit 条。"""
+        ordered = sorted(dets, key=lambda d: d["conf"], reverse=True)[:limit]
         return json.dumps(
-            [{"cls": d["cls"], "conf": round(d["conf"], 3), "xyxy": d["xyxy"]}
-             for d in dets],
-            ensure_ascii=False,
+            [{"cls": d["cls"], "conf": round(d["conf"], 3),
+              "cx": round(d["cx"], 4), "cy": round(d["cy"], 4),
+              "w": round(d["w"], 4), "h": round(d["h"], 4)}
+             for d in ordered],
+            ensure_ascii=False, separators=(",", ":"),
         )

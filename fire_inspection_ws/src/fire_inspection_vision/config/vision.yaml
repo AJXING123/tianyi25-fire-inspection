@@ -23,3 +23,9 @@ timeouts:
 defaults:
   expect_classes: []
   abnormal_classes: [smoking, fire]
+
+# 常驻扫描节点（vision_scan_node）：持续推理并发 /fire_inspection/detection
+dry_run: false
+scan:
+  topic: /fire_inspection/detection
+  rate_hz: 2.0        # 推理限速，太低会漏目标，太高会占满 GPU
