@@ -1,7 +1,8 @@
 [Unit]
 Description=Fire Inspection Head Sweep (ty2.5)
+# 必须等底盘控制栈起来，否则 /head/cmd 无人接收，头部空跑
 After=network-online.target robot-control.service
-Wants=network-online.target
+Wants=network-online.target robot-control.service
 StartLimitIntervalSec=0
 
 [Service]
@@ -10,6 +11,9 @@ User=nvidia
 Group=nvidia
 Environment=HOME=/home/nvidia
 Environment=ROS_LOG_DIR=/home/nvidia/logs/ros
+Environment=PYTHONUNBUFFERED=1
+WorkingDirectory=/home/nvidia/fire-inspection/fire_inspection_ws
+ExecStartPre=/bin/mkdir -p /home/nvidia/logs/ros
 ExecStart=/bin/bash -c 'source /opt/ros/jazzy/setup.bash && source /home/nvidia/xos/setup.bash && source /home/nvidia/fire-inspection/fire_inspection_ws/install/setup.bash && exec ros2 run fire_inspection_head head_sweep_server --ros-args -p auto_start:=true'
 Restart=on-failure
 RestartSec=5
