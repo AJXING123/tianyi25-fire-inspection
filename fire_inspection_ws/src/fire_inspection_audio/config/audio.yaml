@@ -1,0 +1,58 @@
+# 消防巡检听觉检测配置
+audio:
+  # 音频源：
+  #   lyre        = 平台头部 8 阵麦 /lyre/audio_stream（推荐，远场拾音）
+  #   sounddevice = 本地 USB 麦直采（device 指定），兜底
+  source: lyre
+
+  # lyre 模式：启动时调用 /lyre/audio_control 打开头部麦音频流，
+  # 退出时关闭。cae_mode 留空用平台默认。
+  cae_mode: ""
+
+  # sounddevice 直采（仅 source=sounddevice 时生效）：
+  # "USB Audio Device" = C-Media USB 麦（card 1）；AIUI 阵列(card 2)被占用勿抢
+  device: "USB Audio Device"
+
+  # 采样率需与源一致。lyre 流为 16000Hz 单声道 16bit；
+  # sounddevice 用 C-Media 麦时为 48000（该麦只支持 48000/44100）
+  sample_rate: 16000
+  channels: 1
+  record_chunk_s: 2.0       # 滑窗长度（秒）
+  hop_s: 0.5                # 滑窗步进（秒），越小越灵敏
+
+  # 播报结束后继续屏蔽的秒数：让 2s 环形缓冲里机器人自己的尾音排空。
+  # 2.5s > 环形缓冲 2s，保证恢复监听时缓冲里已无自己播报的残余。
+  speaking_guard_s: 2.5
+
+  # MFCC 指纹匹配阈值。2026-10-30 户外实测：机械窄带噪声擦门误报
+  # sim=0.851~0.855（conc 0.21~0.28），故从 0.84 提至 0.86。
+  match_threshold: 0.86
+
+  # 谱集中度门：300~3000Hz 带内 top-3 频点功率占比。警报是窄带扫频音
+  # （样本实测 0.406），语音/宽带噪声能量摊开（实测 0.08~0.13）。
+  min_band_concentration: 0.20
+
+  # 峰值频带门：全谱逐帧主峰的中位数必须落在此带内。警报扫频主峰
+  # 398~2445Hz（中位 781Hz）；户外误报源的声能量主峰在 4.5~6kHz
+  # （机械啸叫/高频告警器），即使 sim/conc 都过门也被此门拒绝。
+  peak_band_hz: [300, 3000]
+
+  # 响度门：只挡数字静音/近乎无声（<0.008），不做响度区分。
+  # 教训（2026-10-30）：0.025 会把音量小/距离远的真警报整体杀掉
+  # （环境噪声本身就有 0.019），且人声凑近说话响度大照样过门，
+  # 只防安静误报不防大声误报，反而制造漏检。区分交给指纹阈值+连续帧。
+  min_rms: 0.008
+
+  # 警报触发后的冷却（秒），防止同一段警报反复命中
+  cooldown_s: 15.0
+
+  # 最小命中连续帧数：警报是持续扫频音，可长时间保持高 sim；
+  # 人声是断续音节，sim 波动大，实测从未连续 5 帧（2.5s）越过 0.86
+  min_hits: 5
+
+  # 警报样本文件列表（相对于本 config 目录）
+  samples:
+    - air_raid.wav           # 防空警报样本
+
+  # dry_run=true 时只在日志里打印命中，不发 alert（静默测试用）
+  dry_run: false
