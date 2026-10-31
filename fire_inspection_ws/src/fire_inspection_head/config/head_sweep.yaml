@@ -5,9 +5,11 @@ publish_rate_hz: 100.0
 speed: 0.15
 current: 2.0
 
-# 每步过渡时长与停留时长：放慢节奏给视觉推理留时间
+# 每步过渡时长与停留时长：放慢节奏给视觉推理留时间。
+# 实测头部 0.6rad 约 1.2s 到位，2.0s 过渡足够；停留 2.0s 让整轮扫视
+# 约 24s 走完，与单段轨道（约 20s）同量级，避免「一趟只扫到半个扇区」。
 step_duration_s: 2.0
-step_dwell_s: 3.0
+step_dwell_s: 2.0
 
 # look_at:<yaw>,<pitch> 转向目标的过渡时长（秒）
 look_duration_s: 1.2
@@ -22,14 +24,10 @@ status_topic: /fire_inspection/head_status
 head_cmd_topic: /head/cmd
 robot_state_topic: /robot_state
 
-# 相机视场角（契约 §9：orchestrator 用 look_at 开环换算头部目标角）
-# 初值 80° / 60°，现场标定后回填接口契约冻结表 §9
-h_fov_deg: 80.0
-v_fov_deg: 60.0
-
-# 手柄急停：轴5 正 且 轴4 负（G 拨右 + E 拨上）
+# 手柄急停：已按要求禁用（G 拨右 + E 拨上 不再触发）。
+# 注意必须显式写成空列表，键缺失会回退到默认组合键，等于没关。
 joy_topic: /sbus_data
-stop_axes: [[5, 1], [4, -1]]
+stop_axes: []
 axis_threshold: 0.5
 
 # 开机自启时延迟多少秒开始扫视（等待 robot_control 与 /robot_state 就绪）
@@ -38,10 +36,12 @@ auto_start_delay_s: 30.0
 # 关节：1=roll(保持0) 2=pitch(正=低头) 3=yaw(正=向左)
 # 实测：相机装在头部偏高，目标（灭火器/烟头）都在视线下方，
 # 所以整条序列整体下压，不再留抬头步。
+# yaw 取 ±0.5rad（±29°），配合相机水平半视场 42.7°，两侧合计覆盖
+# 车头左右约 ±71°，比原来的 ±0.35rad（±63°）多看一圈侧面。
 steps:
-  - {name: "大低头+左", pose: [0.0,  0.38,  0.35]}
-  - {name: "大低头+右", pose: [0.0,  0.38, -0.35]}
-  - {name: "中低头+左", pose: [0.0,  0.26,  0.35]}
-  - {name: "中低头+右", pose: [0.0,  0.26, -0.35]}
-  - {name: "平视+左", pose: [0.0,  0.00,  0.35]}
-  - {name: "平视+右", pose: [0.0,  0.00, -0.35]}
+  - {name: "大低头+左", pose: [0.0,  0.38,  0.50]}
+  - {name: "大低头+右", pose: [0.0,  0.38, -0.50]}
+  - {name: "中低头+左", pose: [0.0,  0.26,  0.50]}
+  - {name: "中低头+右", pose: [0.0,  0.26, -0.50]}
+  - {name: "平视+左", pose: [0.0,  0.00,  0.50]}
+  - {name: "平视+右", pose: [0.0,  0.00, -0.50]}
