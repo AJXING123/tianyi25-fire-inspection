@@ -10,6 +10,7 @@
   <depend>rclpy</depend>
   <depend>fire_inspection_interfaces</depend>
   <depend>sensor_msgs</depend>
+  <depend>ros2_bridge_msgs</depend>
   <depend>ament_index_python</depend>
   <depend>launch</depend>
   <depend>launch_ros</depend>

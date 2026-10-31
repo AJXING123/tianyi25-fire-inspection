@@ -7,10 +7,21 @@ action_name: /fire_inspection/inspect_poi
 # 权重不提交 git，机器人上手工放置到 models 目录
 model_path: /home/nvidia/fire-inspection/models/fire_3cls_v2.pt
 
-# 类别阈值：吸烟从宽保证检出，指示牌/灭火器从严压制误检
+# 类别阈值：吸烟仍需保证检出，但不再用 0.25/0.45 这种过松阈值
+# （2026-10-31 实测：0.50/0.52 的误检——只框到裤腿、远处人体——照样触发
+#  停车介入；真实吸烟现场多在 0.6 以上），统一到 0.60。
 thresholds:
-  conf_smoking: 0.25
+  conf_smoking: 0.60
   conf_other: 0.65
+
+# 吸烟框几何下限（归一化）：只框到裤腿/手等局部、或极小的远处目标直接丢弃，
+# 作为阈值之外的第二道闸。
+smoking_geometry:
+  min_w: 0.03
+  min_h: 0.10
+  min_area: 0.01
+  min_aspect: 0.20
+  max_aspect: 1.80
 
 imgsz: 1280
 device: "0"
@@ -30,4 +41,43 @@ defaults:
 dry_run: false
 scan:
   topic: /fire_inspection/detection
-  rate_hz: 2.0        # 推理限速，太低会漏目标，太高会占满 GPU
+  # 实测 imgsz=1280 单帧推理约 9ms，5Hz 远未吃满 GPU。
+  # 现场一次「吸烟」命中在 8m 处置信度只有 0.3 左右且隔帧丢失，
+  # 2Hz 采样太少导致 2s 确认窗口内凑不满 3 帧；提高采样率给确认更多机会。
+  rate_hz: 5.0
+
+# 深度测距（吸烟人员介入用）：把检测框中心的有效深度换算成
+# 「目标相对车头的水平距离 + 方位角」，随 detections_json 一起发布。
+# 相机深度已对齐到 RGB；无有效深度时 range_m=0，编排层只播报、不接近。
+depth:
+  topic: /ob_camera_head/depth/image_raw
+  camera_info_topic: /ob_camera_head/color/camera_info
+  sample_ratio: 0.5      # 只取检测框中心这一比例的区域，避免取到背景
+  min_m: 0.3             # 小于该距离视为无效
+  max_m: 12.0            # 大于该距离视为无效
+  unit: auto             # auto=按编码判断（16UC1 毫米 / 32FC1 米）
+  # 一致性校验：框中心区域有效深度占比低于该值、或深度离散过大（框同时
+  # 覆盖近处地面/门框和远处目标）时，本帧距离判为不可用。
+  # 2026-10-31 实测：人站在 2.5m 外，深度给出 0.61m（取到近处地面），
+  # 直接导致「已贴脸」的错误判断。
+  min_valid_ratio: 0.5
+  max_spread_m: 1.0
+  # 按检测框高度反推距离做交叉验证（针孔模型 Z = fy * 真实高度 / 框高像素），
+  # 只列出的类别才校验；偏差超过 size_check_tolerance 判为不可用，
+  # 下游只会原地播报、不接近。smoking 的先验高度取成年人身高。
+  prior_height_m:
+    smoking: 1.70
+  size_check_tolerance: 0.50
+
+# 视场角兜底（度）：仅在 camera_info 尚未到达/缺失时用于像素偏移线性近似。
+# 正常运行时 vision_scan_node 按 camera_info 的 fx/fy 精确换算；
+# 这里的默认值按头部相机 1280x720、fx≈fy≈692 实测（hfov≈85.5°、vfov≈55.0°）。
+# 编排层 look_at 的兜底参数必须与此一致，禁止在别处再写一套。
+hfov_deg: 85.5
+vfov_deg: 55.0
+
+# 头部姿态：方位角 = 头部 yaw + 像素偏移，因此需要实时 yaw/pitch。
+# 姿态超过 head_pose_timeout_s 未更新视为不可用（只给距离、不给方位角）。
+head_state_topic: /robot_state
+head_pose_timeout_s: 1.0
+
