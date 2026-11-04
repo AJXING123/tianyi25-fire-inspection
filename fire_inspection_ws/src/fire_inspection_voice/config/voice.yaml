@@ -3,6 +3,19 @@ tts_service: /intelligent_interaction/tts/play
 audio_id: audio_guide          # audio_config.json: priority=4, interruptible=true
 dry_run: false                 # true = 只打日志不出声
 
+# 云端 TTS 可达性预检：DNS 解析失败/端口不通时最多等 wait_s 秒；
+# 仍不可达则跳过本次播报（不播放平台失败提示音），不会卡住巡检。
+tts_cloud:
+  host: cosyvoice.x-humanoid-cloud.com
+  port: 9962
+  wait_s: 3.0                    # 0 = 关闭预检（旧行为：照常提交）
+
+# 离线语音缓存：云端合成不可达的巡检点位（如 POI_02/03）改播预录本地音频
+# （TtsService type=file，已验证可离线播放），命中缓存时完全不依赖网络。
+audio_cache:
+  enabled: true
+  dir: /home/nvidia/fire-inspection/audio_cache
+
 timing:
   query_poll_s: 0.2
   playing_status: playing      # 精确匹配，禁止子串包含判断
