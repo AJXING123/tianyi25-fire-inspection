@@ -1,0 +1,22 @@
+[Unit]
+Description=Fire Inspection Orchestrator
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=nvidia
+WorkingDirectory=/home/nvidia/fire-inspection/fire_inspection_ws
+# 钉钉机器人凭证（可选）：把 token/secret 放在这个文件里，避免硬编码在 service
+# 文件格式：
+#   DINGTALK_ACCESS_TOKEN=你的access_token
+#   DINGTALK_SECRET=你的加签密钥
+# 文件不存在或为空时钉钉推送自动关闭
+EnvironmentFile=-/home/nvidia/fire-inspection/dingtalk.env
+Environment=DINGTALK_ENABLED=true
+ExecStart=/bin/bash -c 'source /opt/ros/jazzy/setup.bash && source /home/nvidia/fire-inspection/fire_inspection_ws/install/setup.bash && exec ros2 run fire_inspection_orchestrator orchestrator_node --ros-args -p auto_start:=false -p dingtalk_enabled:=${DINGTALK_ENABLED:-false} -p dingtalk_access_token:=${DINGTALK_ACCESS_TOKEN:-} -p dingtalk_secret:=${DINGTALK_SECRET:-} -r __node:=fire_inspection_orchestrator'
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

@@ -25,6 +25,7 @@ setup(
     entry_points={
         "console_scripts": [
             "orchestrator_node = fire_inspection_orchestrator.orchestrator_node:main",
+            "button_trigger_node = fire_inspection_orchestrator.button_trigger_node:main",
         ],
     },
 )

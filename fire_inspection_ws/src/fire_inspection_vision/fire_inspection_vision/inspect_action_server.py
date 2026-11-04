@@ -52,7 +52,7 @@ class InspectActionServer(Node):
         self.detector = Detector(
             model_path=cfg.get("model_path", ""),
             imgsz=cfg.get("imgsz", 1280),
-            conf_smoking=thresholds.get("conf_smoking", 0.25),
+            conf_smoking=thresholds.get("conf_smoking", 0.45),
             conf_other=thresholds.get("conf_other", 0.65),
             device=str(cfg.get("device", "0")),
         )

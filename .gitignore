@@ -28,3 +28,6 @@ Thumbs.db
 # 临时日志与打包产物
 *.log
 *.zip
+
+# 敏感凭证：钉钉机器人 webhook token + 加签密钥
+dingtalk.env

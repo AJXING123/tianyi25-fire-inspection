@@ -2,14 +2,15 @@
 string poi               # 点位名，以底盘 POI 服务端为准
 bool is_return           # true=返回起点；此时 poi 必须是 start_poi，允许中途撤退
 float32 timeout_s        # 0 表示使用配置默认超时
+bool use_point           # true=本次强制点对点不上轨（吸烟介入后从人员侧方直接前往点位）；返程非法
 ---
 # result
 bool success
 bool is_return           # 回显本次 goal 是否为"返回起点"
 string message           # 人类可读说明，含进度快照，不可作为机器解析契约
-string phase             # 终态分类：arrived | failed | cancelled（timeout 待实机运动实现）
+string phase             # 终态分类：arrived | failed | cancelled | blocked（blocked=受阻且无法绕行，编排层跳过该点）
 ---
 # feedback
-string phase             # navigating | arrived（retrying | relocalizing 待实机运动实现）
+string phase             # navigating | arrived | detour（detour=受阻，正在后退并侧向绕行；retrying | relocalizing 待实机运动实现）
 string mode              # point | track：当前段采用的导航方式
 float32 distance_remaining_m   # 距目标直线距离（m）；arrived 时为 0

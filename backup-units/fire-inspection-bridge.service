@@ -1,0 +1,16 @@
+[Unit]
+Description=Fire Inspection Dashboard Bridge
+After=network-online.target fire-inspection-orchestrator.service
+Wants=network-online.target
+Requires=fire-inspection-orchestrator.service
+
+[Service]
+Type=simple
+User=nvidia
+WorkingDirectory=/home/nvidia/fire-inspection/fire_inspection_ws
+ExecStart=/bin/bash -c 'source /opt/ros/jazzy/setup.bash && source /home/nvidia/fire-inspection/fire_inspection_ws/install/setup.bash && set -a && source /home/nvidia/.config/fire-dashboard-bridge.env && set +a && exec python -m bridge --host 192.168.22.50 --port 8081'
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

@@ -11,7 +11,9 @@
 #   ./run_nav.sh config.yaml          # 指定配置文件
 #   DRY_RUN=true ./run_nav.sh         # 等价于 --dry-run
 #
-# 实机前确认：已重定位（slam_status=0）、轨道无遮挡、有人守护、急停可达。
+# 实机前确认：车已停在起点 start_point（自动重定位的初始位姿取自该点）、
+# 轨道无遮挡、有人守护、急停可达。定位异常（slam_status 1/2/3/5）时，
+# 导航服务端会按 pois.yaml 的 relocalize 配置自动重定位一次，失败则拒绝导航。
 
 set -o pipefail
 
@@ -70,7 +72,7 @@ fi
 
 if [[ "$DRY_RUN" != "true" ]]; then
   echo "!! 即将驱动底盘沿轨道运动，请确认："
-  echo "   1) 已完成重定位（slam_status=0）"
+  echo "   1) 车已停在起点 start_point（自动重定位的初始位姿取自该点）"
   echo "   2) 轨道与点位周围无人、无遮挡"
   echo "   3) 有人守护，急停可达"
   echo "   3 秒后开始，Ctrl-C 可取消"
@@ -86,11 +88,16 @@ node_args=(-p "dry_run:=$DRY_RUN")
 # 直接执行安装后的节点，不经 ros2 run / launch 包装，脚本退出时可可靠回收
 NODE_BIN="$WS/install/fire_inspection_nav/lib/fire_inspection_nav/navigate_to_server"
 echo "==> 启动导航服务端（dry_run=$DRY_RUN），日志：$LOG"
+if [[ "$DRY_RUN" != "true" ]]; then
+  echo "    定位异常时会先自动重定位（最长约 60s），等 Action 服务端就绪期间请勿断电"
+fi
 "$NODE_BIN" --ros-args "${node_args[@]}" >"$LOG" 2>&1 &
 SERVER_PID=$!
 
 ready=0
-for _ in {1..60}; do
+# 节点先做前置校验（含自动重定位，最长 relocalize.timeout_s=60s）才创建 Action 服务端，
+# 因此等待窗口按 120s 给足，避免重定位尚未结束就误判为启动失败并杀掉进程
+for _ in {1..240}; do
   if ros2 action list 2>/dev/null | grep -qx "/fire_inspection/navigate_to"; then
     ready=1
     break
@@ -109,7 +116,7 @@ if grep -q "前置校验失败" "$LOG"; then
   echo "!! 前置校验失败，goal 会被全部拒绝：" >&2
   grep "前置校验失败" "$LOG" | tail -1 >&2
   if grep -q "定位状态异常" "$LOG"; then
-    echo "!! 请先完成重定位，确认 slam_status=0 后再运行" >&2
+    echo "!! 自动重定位未成功：确认车在起点 start_point，定位状态（slam_status）恢复为 0 后再运行" >&2
   fi
   exit 1
 fi

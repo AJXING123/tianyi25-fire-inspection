@@ -7,25 +7,118 @@ action_name: /fire_inspection/inspect_poi
 # 权重不提交 git，机器人上手工放置到 models 目录
 model_path: /home/nvidia/fire-inspection/models/fire_3cls_v2.pt
 
-# 类别阈值：吸烟从宽保证检出，指示牌/灭火器从严压制误检
+# 类别阈值：恢复 2026-10-29 验收通过的现场口径——
+# 吸烟只按阈值判定，不做框几何校验（10-31 引入后现场效果变差，已回退）。
 thresholds:
-  conf_smoking: 0.25
+  conf_smoking: 0.45
   conf_other: 0.65
 
+# 推理分辨率。2026-10-29 现场验收用的是 1280；10-31 曾试 1920/2560，
+# 高分辨率会显著提升小目标召回、同时也更容易把远处人体当吸烟误检，
+# 现场反馈整体效果变差，故验收前统一回退到 1280。
+# 若验收时出现「真吸烟不报」，把下面 imgsz 改成 1920 或 2560 即可。
 imgsz: 1280
 device: "0"
+
+# 人体检测（巡检途中避让行人用）：独立 YOLO 模型，只取 person 类。
+# 与上面的消防三分类模型并行推理，结果并入 /fire_inspection/detection，
+# 由编排层按「先播报 → 侧向绕开 → 继续巡检」处理。
+# 模型为 COCO 预训练权重（person 类），不依赖百度人脸/迎宾接口。
+person:
+  enabled: true
+  model_path: /home/nvidia/fire-inspection/models/person_yolov8n.pt
+  imgsz: 640
+  conf: 0.50             # 人体判定阈值；现场图片实测 0.89~0.95
+
+# 专用香烟检测（YOLO11m，只检 cigarette）：远处烟只有几个像素，
+# 通用三分类模型经常漏检；该模型在现场图上烟=0.88、远距离=0.82。
+# 检出后映射成 smoking 类发布，并要求烟中心落在最大人体框附近，
+# 过滤海报/广告人像上的误报。
+cigarette:
+  enabled: true
+  model_path: /home/nvidia/fire-inspection/models/smoking_cigarette_yolo11m.pt
+  imgsz: 1280
+  conf: 0.50
+  person_margin: 0.25    # 人体框外扩比例（按宽高），再判断烟中心是否在内
+  # 香烟框物理尺度上限（长边 / 最近人体框高）。真香烟只有几厘米长，
+  # 占人体高度不到一成；2026-11-02 返程误报抓拍逐张复核发现，模型把
+  # 眼镜/脸颊/衣领检成香烟时框宽达 0.15~0.31 人体高（整块脸部区域）。
+  # 超过该比例直接判为「不是香烟」，不再进入姿态门控。
+  max_width_ratio: 0.12
+
+# 吸烟姿态门控：专用烟模型会把脸/海报/手机误判成烟，消防裁图也会误判。
+# 真吸烟两种常见姿态：手在嘴边吸、或手拿烟（不在吸）。
+# 现场实测误报（手机/脸/手）的烟框接近正方形（长宽比≈0.9~1.0），
+# 真香烟是长条形（长宽比≥1.2）。因此先要求「长条形香烟框」，再要求它
+# 靠近鼻子（手在嘴边）或靠近手腕（手拿烟）。烟框不满足长宽比一律不认。
+# 门控失败（没人/姿态不可用）时按「不确认吸烟」处理，优先压误报。
+smoking_gate:
+  enabled: true
+  model_path: /home/nvidia/fire-inspection/models/person_pose_yolo11n.pt
+  imgsz: 640
+  conf: 0.50
+  wrist_face_ratio: 0.30   # 手腕-鼻子距离 / 人体框高，越小越严格
+  cigarette_wrist_ratio: 0.50  # 烟框-手腕距离 / 人体框高（手拿烟，不吸也算）
+                               # 2026-11-02 现场：3m 外姿态关键点偏差大，0.20 会把
+                               # 真拿烟（日志 0.28~0.49）全拒掉，放宽到 0.50。
+  cigarette_nose_ratio: 0.12   # 烟框-鼻子距离（手在嘴边吸）
+  cigarette_min_aspect: 1.2    # 香烟框长宽比下限；手机等方块物体≈1.0 会被排除
+  fire_smoke_face_ratio: 0.28  # 特例：香烟模型没检出、消防模型明确看到吸烟时的手-嘴上限
+                               # 原 0.15 会把「手握烟在嘴边」（日志 0.19~0.24）拒掉。
+  wrist_conf: 0.50         # 手腕关键点最低置信度
+  nose_conf: 0.30          # 鼻子关键点最低置信度（头顶贴边时会被裁掉，放宽）
+  # 单帧通过不够：现场站姿偶然抬手/姿态抖动会让某一帧通过。
+  # 窗口内累计够 min_hits 帧通过才判吸烟，避免一次挥手就误报。
+  min_hits: 3
+  window_s: 2.0
 
 timeouts:
   frame_timeout_s: 3.0
   inference_timeout_s: 5.0
 
 # 每个点位的检查目标由 orchestrator 在 goal 中下发，此处只给默认值
+# 类名必须是模型真实类别（smoking / safety_sign / fire_extinguisher）；
+# 写 fire 会被别名映射成 fire_extinguisher，语义与本意（烟火）不符，禁止使用。
 defaults:
   expect_classes: []
-  abnormal_classes: [smoking, fire]
+  abnormal_classes: [smoking]
 
 # 常驻扫描节点（vision_scan_node）：持续推理并发 /fire_inspection/detection
 dry_run: false
 scan:
   topic: /fire_inspection/detection
-  rate_hz: 2.0        # 推理限速，太低会漏目标，太高会占满 GPU
+  # 实测 imgsz=1280 单帧推理约 9ms，5Hz 远未吃满 GPU。
+  # 现场一次「吸烟」命中在 8m 处置信度只有 0.3 左右且隔帧丢失，
+  # 2Hz 采样太少导致 2s 确认窗口内凑不满 3 帧；提高采样率给确认更多机会。
+  rate_hz: 5.0
+
+# 深度测距（吸烟人员介入用）：把检测框中心的有效深度换算成
+# 「目标相对车头的水平距离 + 方位角」，随 detections_json 一起发布。
+# 相机深度已对齐到 RGB；无有效深度时 range_m=0，编排层只播报、不接近。
+depth:
+  topic: /ob_camera_head/depth/image_raw
+  camera_info_topic: /ob_camera_head/color/camera_info
+  sample_ratio: 0.5      # 只取检测框中心这一比例的区域，避免取到背景
+  min_m: 0.3             # 小于该距离视为无效
+  max_m: 12.0            # 大于该距离视为无效
+  unit: auto             # auto=按编码判断（16UC1 毫米 / 32FC1 米）
+  # 一致性校验：框中心区域有效深度占比低于该值、或深度离散过大（框同时
+  # 覆盖近处地面/门框和远处目标）时，本帧距离判为不可用。
+  # 只保留纯物理判据；按框高反推距离的交叉校验已移除——先验身高和框范围
+  # 都不足以支撑它（2026-10-31：深 0.41m / 估算 7.58m 两个都不对，
+  # 直接导致「看到人却跳过接近、原地不动」）。
+  min_valid_ratio: 0.5
+  max_spread_m: 1.0
+
+# 视场角兜底（度）：仅在 camera_info 尚未到达/缺失时用于像素偏移线性近似。
+# 正常运行时 vision_scan_node 按 camera_info 的 fx/fy 精确换算；
+# 这里的默认值按头部相机 1280x720、fx≈fy≈692 实测（hfov≈85.5°、vfov≈55.0°）。
+# 编排层 look_at 的兜底参数必须与此一致，禁止在别处再写一套。
+hfov_deg: 85.5
+vfov_deg: 55.0
+
+# 头部姿态：方位角 = 头部 yaw + 像素偏移，因此需要实时 yaw/pitch。
+# 姿态超过 head_pose_timeout_s 未更新视为不可用（只给距离、不给方位角）。
+head_state_topic: /robot_state
+head_pose_timeout_s: 1.0
+

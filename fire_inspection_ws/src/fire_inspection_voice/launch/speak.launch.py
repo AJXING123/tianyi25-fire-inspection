@@ -22,6 +22,13 @@ def generate_launch_description() -> LaunchDescription:
             default_value="true",
             description="true=不真实播报，仅验证链路",
         ),
+        # 语音单独开关：默认跟随 dry_run。上游（inspection_bringup）只传
+        # speak_dry_run，避免多个子链路用同一个 dry_run 名互相覆盖。
+        DeclareLaunchArgument(
+            "speak_dry_run",
+            default_value=LaunchConfiguration("dry_run"),
+            description="true=只打印不播报；默认跟随 dry_run",
+        ),
     ]
 
     speak_action_server = Node(
@@ -33,7 +40,7 @@ def generate_launch_description() -> LaunchDescription:
             "tts_service": LaunchConfiguration("tts_service"),
             "audio_id": LaunchConfiguration("audio_id"),
             "query_timeout_s": LaunchConfiguration("query_timeout_s"),
-            "dry_run": LaunchConfiguration("dry_run"),
+            "dry_run": LaunchConfiguration("speak_dry_run"),
         }],
     )
 
