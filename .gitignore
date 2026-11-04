@@ -31,3 +31,6 @@ Thumbs.db
 
 # 敏感凭证：钉钉机器人 webhook token + 加签密钥
 dingtalk.env
+
+# 运行时数据：断网时积压的钉钉待发消息
+fire_inspection_ws/dingtalk_queue/
