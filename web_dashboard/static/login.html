@@ -1,0 +1,78 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>登录 · 天轶 2.5 消防巡检后台</title>
+  <link rel="stylesheet" href="/styles.css">
+  <style>
+    .login-wrap {
+      min-height: calc(100vh - 80px);
+      display: grid;
+      place-items: center;
+      padding: 24px;
+    }
+    .login-card {
+      width: 100%;
+      max-width: 380px;
+      background: var(--panel);
+      border: 1px solid var(--border);
+      border-radius: 14px;
+      padding: 32px 28px;
+    }
+    .login-card h2 { font-size: 20px; margin-bottom: 6px; }
+    .login-card .hint { color: var(--muted); font-size: 13px; margin: 0 0 20px; }
+    .login-card label { display: block; font-size: 13px; color: var(--muted); margin-bottom: 6px; }
+    .login-card input[type="password"] {
+      width: 100%;
+      padding: 10px 12px;
+      border-radius: 8px;
+      border: 1px solid var(--border);
+      background: var(--panel-alt);
+      color: var(--text);
+      font-size: 15px;
+      outline: none;
+    }
+    .login-card input[type="password"]:focus { border-color: var(--accent); }
+    .login-card .btn { width: 100%; margin-top: 16px; justify-content: center; }
+    .login-error {
+      display: none;
+      margin-bottom: 14px;
+    }
+    .login-error.show { display: block; }
+  </style>
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">
+      <span class="brand-mark">TY</span>
+      <div>
+        <h1>天轶 2.5 消防巡检后台</h1>
+        <p class="subtitle">团队共享密码登录</p>
+      </div>
+    </div>
+  </header>
+
+  <main class="login-wrap">
+    <div class="login-card">
+      <h2>请输入访问密码</h2>
+      <p class="hint">本页面仅限团队成员访问，密码由负责人统一分发。</p>
+      <div id="login-error" class="banner banner-error login-error" role="alert">
+        密码错误，请重试。
+      </div>
+      <div id="login-setup" class="banner banner-error" role="alert" hidden>
+        登录未启用：服务端未配置登录密码环境变量。
+      </div>
+      <form method="post" action="/login" autocomplete="off">
+        <input type="hidden" name="next" id="next-field" value="/">
+        <label for="password">访问密码</label>
+        <input type="password" id="password" name="password"
+               placeholder="请输入密码" required autofocus>
+        <button class="btn btn-primary" type="submit">登 录</button>
+      </form>
+    </div>
+  </main>
+
+  <script src="/auth.js"></script>
+</body>
+</html>
