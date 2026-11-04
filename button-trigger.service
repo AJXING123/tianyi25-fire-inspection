@@ -1,0 +1,29 @@
+[Unit]
+Description=Fire Inspection Remote Button Trigger (ty2.5)
+# 等平台进程管理器起来，保证 /joystick 已在发 /sbus_data/event
+After=network-online.target proc_manager.service
+Wants=network-online.target proc_manager.service
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+User=nvidia
+Group=nvidia
+Environment=HOME=/home/nvidia
+Environment=ROS_LOG_DIR=/home/nvidia/logs/ros
+Environment=PYTHONUNBUFFERED=1
+WorkingDirectory=/home/nvidia/fire-inspection/fire_inspection_ws
+ExecStartPre=/bin/mkdir -p /home/nvidia/logs/ros
+# trigger_key: 4=KEY_B_DOWN（B 键按下）；改键位只改这里
+# start_head=false：复用开机自启的 head-sweep.service
+# dry_run=false：真机模式（真实导航 / 视觉推理 / 语音播报）
+# auto_start=true：按 B 拉起全链路后自动开始巡检，再按一次终止
+# 注意：按 B 前确认车在巡检起点、周围无人、急停可达
+ExecStart=/bin/bash -c 'source /opt/ros/jazzy/setup.bash && source /home/nvidia/xos/setup.bash && source /home/nvidia/fire-inspection/fire_inspection_ws/install/setup.bash && exec ros2 run fire_inspection_orchestrator button_trigger_node --ros-args -p trigger_key:=4 -p start_head:=false -p dry_run:=false -p auto_start:=true'
+Restart=on-failure
+RestartSec=5
+KillSignal=SIGINT
+TimeoutStopSec=30
+
+[Install]
+WantedBy=multi-user.target
