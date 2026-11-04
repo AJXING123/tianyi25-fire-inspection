@@ -1358,6 +1358,21 @@ class NavigateToServer(Node):
             )
 
         with self._seq_lock:
+            # 新一轮从起点启动（非正常返程）时，清除上一次中断留下的进度
+            if (
+                poi == self._start_poi
+                and not is_return
+                and self._started
+                and not self._round_complete()
+            ):
+                self.get_logger().warn(
+                    f"检测到新一轮从起点启动，重置上次中断进度："
+                    f"{self._progress()}"
+                )
+                self._started = False
+                self._returned = False
+                self._next_index = 0
+
             order_error = self._order_error(poi, is_return)
         if order_error is not None:
             return self._fail(goal_handle, result, order_error)
