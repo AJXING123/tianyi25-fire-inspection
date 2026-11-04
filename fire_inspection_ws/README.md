@@ -27,7 +27,7 @@
 > （`POI_01`/`POI_02` 停 5s、`POI_04` 停 3s），起点与返程不停留。
 > 注意：底盘固件会忽略 `move_to_locations` 的 `target_position.yaw`，且跨全图的点对点返程会规划失败，因此返程必须走轨道。
 > 每段运动前开 AEB、轮询动作状态到终态，成功/失败/取消都会停车并关 AEB。
-> 实机模式启动时严格校验定位（`slam_status != 0` 直接拒绝所有 goal）与底盘健康（A 类故障直接拒绝并输出 DTC），
+> 实机模式启动时严格校验定位（`slam_status != 0` 直接拒绝所有 goal）与底盘健康（A/B 类故障直接拒绝并输出 DTC；C 类告警如「WiFi 未连接」只记 WARN 不拦车——底盘 `hasFatal` 是聚合标志，WiFi 断连也会置真）。
 > 每段运动前按 `speed.outbound_mps` / `speed.return_mps`（默认均为 0.4 m/s）下发限速，
 > 首次写入前备份底盘原值，节点退出时恢复。
 > 导航服务端只使用底盘 SDK，不初始化 `robot_controller` 门面，避免连带拉起手臂 / 手部 / 相机。
@@ -100,6 +100,7 @@ fire_inspection_ws/
 | `PoiResult` | msg | 单点位检查结果（含 `simulated` 标记） |
 | `InspectionControl` | srv | 巡检启停控制 |
 | `NavigateTo` | action | 前往指定 POI |
+| `ApproachTarget` | action | 按「方位角 + 距离」走到人员前方安全距离（吸烟介入） |
 | `Speak` | action | 播报一段文本 |
 | `InspectPoi` | action | 检查指定 POI 的设施 |
 
@@ -108,7 +109,7 @@ fire_inspection_ws/
 ```
 fire_inspection_interfaces ──（所有包的接口依赖，最底层）
         │
-        ├──► fire_inspection_nav      （NavigateTo）
+        ├──► fire_inspection_nav      （NavigateTo / ApproachTarget）
         ├──► fire_inspection_voice    （Speak）
         ├──► fire_inspection_vision   （InspectPoi）
         │
@@ -187,6 +188,9 @@ start_point → POI_01 → POI_02 → POI_03
 | `ros2 launch fire_inspection_orchestrator orchestrator.launch.py` | 仅编排层（调试用） | orchestrator |
 
 所有 launch 均支持 `dry_run:=true|false`；`inspection_bringup.launch.py` 会把该参数透传给四个子链路。
+
+> 只想听声音、不动车：`inspection_bringup.launch.py dry_run:=true speak_dry_run:=false`
+> （`speak_dry_run` 默认跟随 `dry_run`；按键触发节点对应参数是 `speak_real:=true`）。
 
 ### 头部扫视开机自启（systemd）
 
@@ -271,16 +275,75 @@ curl -s http://192.168.11.10:9090/api/core/slam/v1/localization/status
 - 转向后回读位姿校验朝向，误差超过 0.10 rad 自动重试一次，仍超限则 goal 失败；
 - 到点后校验实际位置与 POI 的偏差，超过 `arrival_tolerance_m`（默认 0.5m）则 goal 失败，
   避免固件报成功但车停在别处；
-- 点位朝向以底盘地图为唯一真源（`POI_03` 为地图中的 -60° / -1.0472 rad），本地不再覆盖；
+- 点位朝向以底盘地图为真源；需要改动时在 `pois.yaml` 的 `yaw_overrides` 里
+  本地覆盖（只影响到点转向，不改地图）。当前 `POI_03` 覆盖为 -90°（-1.5708），
+  与 `POI_01`/`POI_02` 同向、面向走廊一侧；底盘地图里仍是 -60°；
   前置校验会告警"轨道航点朝向 vs 点位朝向"不一致：想让车到点即朝向规定角度，
   需在图中把对应轨道末端航点朝向改成点位朝向（不依赖到点补转）；
 - 每个点位到点后按 `_dwell_for` 停留：起点与返程 0s；`dwell_overrides` 优先
   （`POI_04` 为 3s）；未单独配置的 `transit_pois` 0s；其余巡检点位 `dwell_s`（默认 5s）；
   停留期间可被取消；
 - 返程沿 `tracks.return`（POI_04 → 起点）返回，到点后同样转向到起点朝向；
-  跨全图的点对点返程在底盘上会规划失败，不要使用。
+  跨全图的点对点返程在底盘上会规划失败，不要使用；
+- 返程被介入/取消打断后重发时，导航会传 `move_to_locations(start_position=当前轨道投影,
+  target_position=起点)` 从当前位置**接着往前走**，不再让 `uptrack` 把车拉回 POI_04；
+  若底盘拒绝该续行方式，自动回退到原上轨方式，保证返程仍能完成。
 
 > ⚠️ 实机调试必须有人守护、急停可达、轨道无障碍；首次测试建议保持 0.4 m/s 以下。
+
+### 5.3 吸烟人员介入（默认：停车 → 侧向绕开 → 继续巡检）
+
+> 默认配置把 `smoking` 放在 `intervention.avoid_classes` 里：确认后先停车，
+> 再按视觉方位角向**远离人员的一侧**横移 `avoid_offset_m`（默认 1.5m，导航侧做
+> 走廊/软限位校验），播报后重发原目标继续巡检。
+> 只播报不停车用 `speak_only_classes`；「走到人前方 2m」用 `approach` 流程。
+> 无有效方位角/测距时不会盲动，退化为只停车播报。
+
+导航途中（含前往起点、巡检点、过点点位、返程）持续扫视；连续 `confirm_frames`
+帧确认 `smoking` 后走一次介入：
+
+```
+导航在途 ──确认吸烟──► 取消当前 NavigateTo（停车）
+        ──Speak──► 播报警示「发现吸烟行为，请立即停止吸烟」
+        ──侧向横移绕开人员──► Speak「已避开吸烟人员并记录，继续巡检」
+        ──重发同一点位──► 点对点继续前往原固定点位（顺序状态未推进）
+```
+
+- 动作分工：视觉只给「距离 + 方位角」，底盘动作只由 `fire_inspection_nav` 的
+  `ApproachTarget`（`/fire_inspection/approach_target`）下发，编排层仍是唯一指挥者；
+- 绕行复用 `ApproachTarget`：传 `standoff_m == range_m` 把前进量变为 0，只保留
+  `side_offset_m` 的侧向横移；`bearing_rad>0`（人在左）→ 从右侧绕，`<0` → 从左侧绕，
+  正前方默认右侧；横移距离用 `intervention.avoid_offset_m`，导航侧再用 `pois.yaml`
+  的 `corridor` / `range_limit` 校验落点，越界会返回 `skipped`（只播报不横移）；
+- 视觉侧：`vision_scan_node` 用头部相机深度（`depth` 段）+ 实时头部 yaw/pitch 合成
+  `range_m` / `bearing_rad` / `look_pitch_rad` / `range_valid` 四个扩展字段
+  （像素偏移优先用 `camera_info` 内参换算，内参未到才退回 `hfov_deg`/`vfov_deg`）；
+  深度或头部姿态超时则 `range_valid=false`，此时只停车播报、**不靠近人员**（旧版视觉结果同样如此）；
+- 安全边界（全部在 `pois.yaml` 的 `approach` 段，编排层不重复配一套）：
+  `range<=0` / 小于 `min_range_m` / 大于 `max_range_m` / 需位移超过 `max_travel_m` /
+  接近点超软限位 → 一律 `skipped`，原地转向后播报；接近段单独限速 `speed_mps`（默认 0.35）；
+  位移小于 0.3m 时只原地转向，不前后挪动；
+- 防重复：`intervention.max_per_poi`（默认 1）限制同一点位介入次数，
+  `intervention.max_total`（默认 5）限制本轮总次数，介入结束后进入 `cooldown_s` 冷却；
+  两者配成 `0`（不限）时仍有一道路段硬上限（同一段路最多 3 次），
+  达到后本段剩余路程只播报、不再停车接近，避免巡检被一个人卡死；
+- 到点与取消同时发生（取消生效前已到点）：就地介入并**不再接近**，避免离开点位导致后续
+  视觉检查拍不到检查项；
+- 接近失败只告警，不阻断播报与后续巡检；`ApproachTarget` 服务端缺失时自动降级为
+  「只停车播报，不靠近人员」；
+- 状态文本：介入期间 T4 为 `running:intervene:<poi>`，控制台可据此提示现场。
+
+手动验证接近（`dry_run` 只做几何与控制流校验，不下发运动指令）：
+
+```bash
+ros2 action send_goal /fire_inspection/approach_target \
+  fire_inspection_interfaces/action/ApproachTarget \
+  "{bearing_rad: 0.0, range_m: 6.0, standoff_m: 2.0, timeout_s: 0.0}" --feedback
+```
+
+> ⚠️ 已知限制：`smoking` 检测框可能只框住香烟而非整个人（距离取框中心，可能偏近/偏远）；
+> 单目 + 深度测距精度有限，接近点是估算值，到位偏差只告警不判失败；
+> 离轨后回到原目标依赖 `move_to_locations_poi(..., uptrack_enabled=true)` 重新上轨。
 
 ---
 
@@ -288,11 +351,11 @@ curl -s http://192.168.11.10:9090/api/core/slam/v1/localization/status
 
 | 文件 | 内容 | 唯一真源约束 |
 | --- | --- | --- |
-| `fire_inspection_nav/config/pois.yaml` | 点位顺序、巡检/返程轨道名、过点点位、停留时间、分段限速、超时、应用层软限位 | 坐标与朝向以底盘 POI 服务端为准，**禁止写第二份坐标/朝向** |
+| `fire_inspection_nav/config/pois.yaml` | 点位顺序、巡检/返程轨道名、过点点位、停留时间、分段限速、超时、应用层软限位、人员接近安全边界（`approach`） | 坐标与朝向以底盘 POI 服务端为准，**禁止写第二份坐标/朝向**；接近距离/位移/限速只在这里配置 |
 | `fire_inspection_voice/config/voice.yaml` | TTS 服务名、`audio_id`、完成判定时序 | 完成判定只认 `status == "playing"` |
-| `fire_inspection_vision/config/vision.yaml` | 相机、模型路径、置信度、超时 | 模型路径留空即视为 `NO_MODEL` |
+| `fire_inspection_vision/config/vision.yaml` | 相机、模型路径、置信度、超时、深度测距与视场角 | 模型路径留空即视为 `NO_MODEL`；FOV 与编排层 `hfov_deg`/`vfov_deg` 必须同源 |
 | `fire_inspection_head/config/head_sweep.yaml` | 扫视序列、节奏、发布频率、手柄急停键 | 改参数需重启节点，不用重编译 |
-| `fire_inspection_orchestrator/config/inspection_script.yaml` | 点位检查项、播报文案、流程开关 | 流程编排的唯一真源 |
+| `fire_inspection_orchestrator/config/inspection_script.yaml` | 点位检查项、播报文案、流程开关、吸烟介入策略（`intervention`） | 流程编排的唯一真源；介入只管策略，安全边界在 `pois.yaml` |
 
 > **模型权重不入库**（见仓库根 `.gitignore`）：手工把权重放到仓库根的 `models/`，
 > 例如 `models/fire_3cls_v2.pt`，并让 `vision.yaml` 的 `model_path` 指向它。
