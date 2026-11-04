@@ -1,0 +1,16 @@
+# goal
+float32 bearing_rad      # 目标相对车头方向（rad，+左 / -右），由视觉按头部 yaw 合成
+float32 range_m          # 目标到相机的水平距离（m），<=0 表示无有效测距
+float32 standoff_m       # 期望停车距离（m），0 表示使用 pois.yaml 默认值
+float32 side_offset_m    # 站位侧向偏移（m），>0 停在目标左侧、<0 右侧；0 表示使用 pois.yaml 默认值
+float32 timeout_s        # 0 表示使用配置默认超时
+---
+# result
+bool success
+string phase             # arrived | skipped | failed | cancelled
+float32 final_range_m    # 停车后与目标的水平距离（m）
+string message           # 人类可读说明
+---
+# feedback
+string phase             # approaching | rotating | arrived
+float32 distance_remaining_m   # 距接近点直线距离（m）；arrived 时为 0

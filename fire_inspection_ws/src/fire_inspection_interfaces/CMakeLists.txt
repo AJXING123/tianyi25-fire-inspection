@@ -13,6 +13,7 @@ rosidl_generate_interfaces(${PROJECT_NAME}
   "action/NavigateTo.action"
   "action/Speak.action"
   "action/InspectPoi.action"
+  "action/ApproachTarget.action"
   DEPENDENCIES std_msgs
 )
 
