@@ -125,6 +125,53 @@ def generate_launch_description() -> LaunchDescription:
             default_value="",
             description="钉钉机器人安全设置里的加签密钥（加签模式必填）",
         ),
+        # 第二个钉钉群（正式群）：参数与群 1 相同，两个群独立发送
+        DeclareLaunchArgument(
+            "dingtalk2_enabled",
+            default_value="false",
+            description="true=启用第二个钉钉群（正式群）推送",
+        ),
+        DeclareLaunchArgument(
+            "dingtalk2_access_token",
+            default_value="",
+            description="正式群机器人 webhook URL 里 ?access_token= 后面那串",
+        ),
+        DeclareLaunchArgument(
+            "dingtalk2_secret",
+            default_value="",
+            description="正式群机器人安全设置里的加签密钥",
+        ),
+        # 阿里云 OSS —— 抓拍图上传后拿 7 天签名 URL，嵌进钉钉 Markdown 卡片
+        DeclareLaunchArgument(
+            "oss_enabled",
+            default_value="false",
+            description="true=上传抓拍图到 OSS 并在钉钉卡片里显示图片",
+        ),
+        DeclareLaunchArgument(
+            "oss_endpoint",
+            default_value="",
+            description="OSS 地域节点，如 oss-cn-shanghai.aliyuncs.com",
+        ),
+        DeclareLaunchArgument(
+            "oss_bucket",
+            default_value="",
+            description="Bucket 名称，建议设为私有读",
+        ),
+        DeclareLaunchArgument(
+            "oss_access_key_id",
+            default_value="",
+            description="RAM 子账号 AccessKeyId（仅授予该 Bucket 的 PutObject 权限）",
+        ),
+        DeclareLaunchArgument(
+            "oss_access_key_secret",
+            default_value="",
+            description="RAM 子账号 AccessKeySecret",
+        ),
+        DeclareLaunchArgument(
+            "oss_url_expire_s",
+            default_value="604800",
+            description="签名 URL 有效期（秒），默认 7 天",
+        ),
     ]
 
     # 常驻 systemd 服务已在跑时复用，避免同一 action/service 出现两套实例
@@ -230,6 +277,15 @@ def generate_launch_description() -> LaunchDescription:
             "dingtalk_enabled": LaunchConfiguration("dingtalk_enabled"),
             "dingtalk_access_token": LaunchConfiguration("dingtalk_access_token"),
             "dingtalk_secret": LaunchConfiguration("dingtalk_secret"),
+            "dingtalk2_enabled": LaunchConfiguration("dingtalk2_enabled"),
+            "dingtalk2_access_token": LaunchConfiguration("dingtalk2_access_token"),
+            "dingtalk2_secret": LaunchConfiguration("dingtalk2_secret"),
+            "oss_enabled": LaunchConfiguration("oss_enabled"),
+            "oss_endpoint": LaunchConfiguration("oss_endpoint"),
+            "oss_bucket": LaunchConfiguration("oss_bucket"),
+            "oss_access_key_id": LaunchConfiguration("oss_access_key_id"),
+            "oss_access_key_secret": LaunchConfiguration("oss_access_key_secret"),
+            "oss_url_expire_s": LaunchConfiguration("oss_url_expire_s"),
         }.items(),
         # 常驻编排层已在跑时复用，避免重复实例因单实例锁启动即退出
         condition=IfCondition("false" if orch_in_service else "true"),

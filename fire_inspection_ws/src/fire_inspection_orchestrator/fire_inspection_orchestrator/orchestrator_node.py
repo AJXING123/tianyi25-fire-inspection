@@ -52,6 +52,7 @@ from std_msgs.msg import String
 
 from fire_inspection_interfaces.action import (ApproachTarget, InspectPoi,
                                                NavigateTo, Speak)
+from fire_inspection_interfaces.msg import PoiResult
 from fire_inspection_interfaces.srv import InspectionControl
 from fire_inspection_voice.speech_texts import (
     SPEECH_TEXTS,
@@ -389,7 +390,9 @@ class OrchestratorNode(Node):
         self._intervention_timeout_s = 60.0
 
         # detection 订阅（WATCH 模式驱动源）
-        from fire_inspection_interfaces.msg import PoiResult
+        self._poi_result_pub = self.create_publisher(
+            PoiResult, "/fire_inspection/poi_result", 10
+        )
         self._detection_sub = self.create_subscription(
             PoiResult,
             str(self.get_parameter("detection_topic").value),
@@ -422,6 +425,8 @@ class OrchestratorNode(Node):
         self._cam_frame = None          # (recv_monotonic, jpeg_bytes)
         self._capture_last = {}         # 各异常类型的落盘冷却（monotonic）
         self._capture_cooldown_s = 10.0  # 同类异常至少间隔这么久才再拍
+        self._dashboard_event_last = {}
+        self._dashboard_event_cooldown_s = 10.0
         # 抓拍图自动保留天数（超过 N 天的 jpg 会被清理）。0 表示不清理。
         self.declare_parameter("capture_retention_days", 7)
         self._capture_retention_days = float(
@@ -441,21 +446,108 @@ class OrchestratorNode(Node):
         self.declare_parameter("dingtalk_secret", "")
         self._dingtalk_secret = str(
             self.get_parameter("dingtalk_secret").value).strip()
+        # 第二个钉钉群（正式群）：参数与群 1 完全相同，单独开关。
+        # 两个群各自独立发送、独立入队重试，一个群断网/凭证错不影响另一个。
+        self.declare_parameter("dingtalk2_enabled", False)
+        self.declare_parameter("dingtalk2_access_token", "")
+        self.declare_parameter("dingtalk2_secret", "")
         self._dingtalk_last_send = {}       # 每类异常钉钉发送节流（防刷屏）
         self._dingtalk_cooldown_s = 30.0    # 同类异常钉钉至少间隔这么久才再发一次
+        self._dt_targets = []   # [{"key","label","token","secret"}]
+        for _key, _label, _enabled, _token, _secret in (
+            ("g1", "群1（测试群）", self._dingtalk_enabled,
+             self._dingtalk_token, self._dingtalk_secret),
+            ("g2", "群2（正式群）",
+             bool(self.get_parameter("dingtalk2_enabled").value),
+             str(self.get_parameter("dingtalk2_access_token").value).strip(),
+             str(self.get_parameter("dingtalk2_secret").value).strip()),
+        ):
+            if _enabled and _token and _secret:
+                self._dt_targets.append(
+                    {"key": _key, "label": _label,
+                     "token": _token, "secret": _secret})
+            elif _enabled:
+                self.get_logger().warn(
+                    f"📣 {_label} 已开启但 access_token/secret 不全，跳过该群")
+        self._dt_target_map = {t["key"]: t for t in self._dt_targets}
         # 启动时打印钉钉状态，方便 journalctl 直接确认参数是否注入成功
-        _dt_ok = (self._dingtalk_enabled and self._dingtalk_token
-                  and self._dingtalk_secret)
+        _dt_ok = bool(self._dt_targets)
         if _dt_ok:
+            for _t in self._dt_targets:
+                self.get_logger().info(
+                    f"📣 钉钉推送已启用[{_t['label']}]："
+                    f"token={_t['token'][:6]}...{_t['token'][-4:]}，"
+                    f"secret={_t['secret'][:6]}...{_t['secret'][-4:]}")
             self.get_logger().info(
-                f"📣 钉钉推送已启用：token={self._dingtalk_token[:6]}...{self._dingtalk_token[-4:]}，"
-                f"secret={self._dingtalk_secret[:6]}...{self._dingtalk_secret[-4:]}，"
-                f"白名单=吸烟/设施异常/防空警报（person 不入钉钉），无冷却=检测几次发几次")
+                f"📣 钉钉推送共 {len(self._dt_targets)} 个群，"
+                "白名单=吸烟/设施异常/防空警报（person 不入钉钉），无冷却=检测几次发几次")
         else:
             self.get_logger().warn(
                 f"📣 钉钉推送未启用：enabled={self._dingtalk_enabled}，"
                 f"token={'有' if self._dingtalk_token else '无'}，"
                 f"secret={'有' if self._dingtalk_secret else '无'}")
+
+        # 阿里云 OSS：钉钉自定义机器人不能直发本地图片，只能引用公网 URL。
+        # 抓拍图先上传 OSS，再生成 7 天有效的签名 URL 嵌进 Markdown 卡片。
+        # Bucket 建议设为私有读，靠签名 URL 授权访问，避免证据图被公网随意下载。
+        self.declare_parameter("oss_enabled", False)
+        self._oss_enabled = bool(self.get_parameter("oss_enabled").value)
+        self.declare_parameter("oss_endpoint", "")
+        self._oss_endpoint = str(
+            self.get_parameter("oss_endpoint").value).strip()
+        self.declare_parameter("oss_bucket", "")
+        self._oss_bucket = str(self.get_parameter("oss_bucket").value).strip()
+        self.declare_parameter("oss_access_key_id", "")
+        self._oss_ak_id = str(
+            self.get_parameter("oss_access_key_id").value).strip()
+        self.declare_parameter("oss_access_key_secret", "")
+        self._oss_ak_secret = str(
+            self.get_parameter("oss_access_key_secret").value).strip()
+        self.declare_parameter("oss_key_prefix", "fire_inspection")
+        self._oss_key_prefix = str(
+            self.get_parameter("oss_key_prefix").value).strip().strip("/")
+        self.declare_parameter("oss_url_expire_s", 7 * 24 * 3600)
+        self._oss_url_expire_s = int(
+            self.get_parameter("oss_url_expire_s").value)
+        self._oss_ready = bool(
+            self._oss_enabled and self._oss_endpoint and self._oss_bucket
+            and self._oss_ak_id and self._oss_ak_secret)
+        if self._oss_ready:
+            self.get_logger().info(
+                f"📤 OSS 图片上传已启用：bucket={self._oss_bucket} "
+                f"endpoint={self._oss_endpoint} 签名有效期={self._oss_url_expire_s}s")
+        elif self._oss_enabled:
+            self.get_logger().warn(
+                "📤 OSS 已开启但参数不全（endpoint/bucket/AccessKey），"
+                "本次将退回只发文件名")
+
+        # 断网补发：机器人巡检时常跑进无网区域（2026-11-04 现场反馈
+        # 「跑出去一会儿就断网」），异常必须先落盘再发，不能一断网就丢。
+        # 每次异常把「类型/抓拍图/详情/发生时间」写一份 JSON 到本地队列，
+        # 发送成功才删除；后台定时器每 dingtalk_retry_s 秒重试一次，
+        # 网络恢复后按发生时间顺序补发，服务重启也不会丢队列。
+        self.declare_parameter(
+            "dingtalk_queue_dir",
+            os.path.join(os.path.dirname(self._capture_dir), "dingtalk_queue"))
+        self._dt_queue_dir = str(
+            self.get_parameter("dingtalk_queue_dir").value).strip()
+        self.declare_parameter("dingtalk_retry_s", 30.0)
+        self._dt_retry_s = float(self.get_parameter("dingtalk_retry_s").value)
+        self._dt_ok = bool(_dt_ok)
+        self._dt_flush_lock = threading.Lock()  # 补发线程互斥，避免并发重复发
+        self._dt_warn_last = 0.0                # 离线告警节流（monotonic）
+        if self._dt_ok:
+            try:
+                os.makedirs(self._dt_queue_dir, exist_ok=True)
+            except OSError as exc:
+                self.get_logger().warn(
+                    f"[dingtalk] 待发队列目录创建失败：{exc}")
+            self._dt_flush_timer = self.create_timer(
+                max(5.0, self._dt_retry_s), self._dingtalk_flush_tick)
+            self.get_logger().info(
+                f"📥 钉钉断网补发已启用：队列={self._dt_queue_dir} "
+                f"重试间隔={max(5.0, self._dt_retry_s):.0f}s")
+
         self._camera_sub = self.create_subscription(
             CompressedImage,
             str(self.get_parameter("capture_camera_topic").value),
@@ -501,6 +593,9 @@ class OrchestratorNode(Node):
         )
         self._state_pub = self.create_publisher(
             String, str(self.get_parameter("state_topic").value), STATE_QOS
+        )
+        self._event_pub = self.create_publisher(
+            String, "/fire_inspection/event", 10
         )
         self._control_srv = self.create_service(
             InspectionControl,
@@ -1330,6 +1425,49 @@ class OrchestratorNode(Node):
         with self._cam_lock:
             self._cam_frame = (time.monotonic(), bytes(msg.data))
 
+    def _publish_dashboard_event(self, kind: str, detail: str = "") -> None:
+        """把需要展示在网页上的异常事件发布给 Bridge。"""
+        if kind.endswith("_abnormal"):
+            event_type = "vision_abnormal"
+            severity = "critical"
+            poi = kind.rsplit("_", 1)[0]
+            message = f"{poi} 检测到设施异常"
+        elif kind.endswith("_uncertain"):
+            event_type = "vision_abnormal"
+            severity = "warning"
+            poi = kind.rsplit("_", 1)[0]
+            message = f"{poi} 检测结果不确定，需要人工复核"
+        elif kind in ("smoking", "air_raid"):
+            event_type = "alarm_detected"
+            severity = "critical"
+            poi = "移动路段"
+            message = "检测到吸烟行为" if kind == "smoking" else "检测到防空警报"
+        else:
+            return
+
+        now = time.monotonic()
+        if now - self._dashboard_event_last.get(kind, 0.0) < self._dashboard_event_cooldown_s:
+            return
+
+        payload = {
+            "event_type": event_type,
+            "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            "source": "orchestrator",
+            "severity": severity,
+            "message": message,
+            "details": {"kind": kind, "detail": detail},
+            "poi": poi,
+            "simulated": False,
+        }
+        try:
+            msg = String()
+            msg.data = json.dumps(payload, ensure_ascii=False)
+            self._event_pub.publish(msg)
+            self._dashboard_event_last[kind] = now
+            self.get_logger().info(f"[dashboard] 异常事件已发布：{kind}")
+        except Exception as exc:  # noqa: BLE001 - 网页上报失败不影响巡检
+            self.get_logger().warn(f"[dashboard] 异常事件发布失败：{exc}")
+
     def _capture_event(self, kind: str, detail: str = "") -> None:
         """异常确认瞬间把缓存的最新相机帧落盘（picture 目录，JPEG 直写）。
 
@@ -1337,6 +1475,7 @@ class OrchestratorNode(Node):
         detail 可选：POI 视觉结果的 result.detail，用来在钉钉卡片上
         精确区分"灭火器缺失"vs"安全指示牌异常"等具体设施。
         """
+        self._publish_dashboard_event(kind, detail)
         try:
             now = time.monotonic()
             if now - self._capture_last.get(kind, 0.0) < self._capture_cooldown_s:
@@ -1365,49 +1504,157 @@ class OrchestratorNode(Node):
     _DINGTALK_WHITELIST = ("smoking", "air_raid")
 
     def _dingtalk_notify(self, kind: str, pic_path: str, detail: str = "") -> None:
-        """抓拍成功后异步发钉钉 Markdown 卡片到群里。
+        """抓拍成功后先把异常写进本地待发队列，再立刻尝试发送一次。
 
-        必须放到独立线程：DNS 解析失败时 urllib 的 timeout=3 并不生效，
+        机器人巡检时常跑进断网路段，所以不能只在有网时才发：消息先落盘成
+        JSON（含原始发生时间），发送成功才删文件；没网就留在队列里等
+        _dingtalk_flush_tick 定时补发，服务重启也不丢。
+
+        发送必须放独立线程：DNS 解析失败时 urllib 的 timeout 并不生效，
         实测会阻塞 20s 以上（2026-11-03 18:04/18:06 现场日志）。这条链路
         原本在检测回调里同步执行，会把「确认 → 播报」整体推迟 20s，现场
         表现就是「都避让了却迟迟没播报」。检测几次发几次（无冷却）——
         冷却只在抓拍落盘层，钉钉本身每发一次。person 等无关 kind 一律跳过，
         只推吸烟 / 设施异常 / 防空警报。
         """
-        threading.Thread(
-            target=self._dingtalk_send, args=(kind, pic_path, detail),
-            daemon=True).start()
+        if not self._dt_ok or kind == "person":
+            return
+        record = {
+            "kind": kind,
+            "pic_path": pic_path,
+            "detail": detail,
+            "created_at": time.time(),
+            "created_str": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime()),
+        }
+        # 每个群各存一条队列记录：某个群发失败只重试该群，不会重复刷另一个群
+        queued = False
+        for target in self._dt_targets:
+            item = dict(record, target=target["key"])
+            queued = self._dingtalk_enqueue(item) or queued
+        if not queued:
+            return
+        # 当前有网就直接发；没网这次会失败，记录留着等定时器补发
+        threading.Thread(target=self._dingtalk_flush_all, daemon=True).start()
 
-    def _dingtalk_send(self, kind: str, pic_path: str, detail: str = "") -> None:
-        """真正的钉钉推送（在后台线程里跑，失败只记日志）。"""
+    def _dingtalk_enqueue(self, record: dict) -> bool:
+        """把一条待发消息原子写入队列目录，避免半截文件被补发读到。"""
         try:
-            if not self._dingtalk_enabled:
-                return
-            if not self._dingtalk_token or not self._dingtalk_secret:
-                self.get_logger().debug(
-                    "[dingtalk] access_token/secret 未配置，跳过发送")
-                return
-            # 白名单过滤：person 等不入钉钉
-            if kind == "person":
-                self.get_logger().debug(
-                    "[dingtalk] person 不入钉钉，跳过发送")
-                return
+            os.makedirs(self._dt_queue_dir, exist_ok=True)
+            name = (f"{int(record['created_at'] * 1000)}_"
+                    f"{record.get('target', 'g1')}_{record['kind']}.json")
+            path = os.path.join(self._dt_queue_dir, name)
+            tmp = path + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(record, f, ensure_ascii=False)
+            os.replace(tmp, path)
+            return True
+        except (OSError, TypeError, ValueError) as exc:
+            self.get_logger().warn(f"[dingtalk] 待发队列写入失败：{exc}")
+            return False
 
+    def _dingtalk_flush_tick(self) -> None:
+        """定时器入口：有积压就起后台线程补发，不占用 ROS 执行器。"""
+        if not self._dt_ok or not os.path.isdir(self._dt_queue_dir):
+            return
+        try:
+            pending = [n for n in os.listdir(self._dt_queue_dir)
+                       if n.endswith(".json")]
+        except OSError:
+            return
+        if pending:
+            threading.Thread(target=self._dingtalk_flush_all, daemon=True).start()
+
+    def _dingtalk_flush_all(self) -> None:
+        """按发生时间顺序补发队列；遇失败立即停下，等下一轮定时器。"""
+        # 上一轮还没跑完（离线时 DNS/urllib 可能卡 20s 以上）就跳过本轮
+        if not self._dt_flush_lock.acquire(blocking=False):
+            return
+        try:
+            try:
+                names = sorted(
+                    n for n in os.listdir(self._dt_queue_dir)
+                    if n.endswith(".json"))
+            except OSError:
+                return
+            sent = 0
+            for name in names:
+                path = os.path.join(self._dt_queue_dir, name)
+                try:
+                    with open(path, "r", encoding="utf-8") as f:
+                        record = json.load(f)
+                except (OSError, ValueError) as exc:
+                    self.get_logger().warn(
+                        f"[dingtalk] 队列文件损坏，已丢弃：{name}（{exc}）")
+                    self._dingtalk_drop(path)
+                    continue
+                pic_path = str(record.get("pic_path", ""))
+                if pic_path and not os.path.isfile(pic_path):
+                    # 本地图已被 7 天清理删掉，退回只发文字，别整条卡住
+                    self.get_logger().warn(
+                        f"[dingtalk] 抓拍图已不存在，改为只发文字：{pic_path}")
+                    pic_path = ""
+                target_key = str(record.get("target", "g1"))
+                if target_key not in self._dt_target_map:
+                    # 该群已在配置里关掉/改了凭证，这条不再有意义
+                    self.get_logger().warn(
+                        f"[dingtalk] 目标群已停用，丢弃队列项：{name}")
+                    self._dingtalk_drop(path)
+                    continue
+                if not self._dingtalk_send(
+                        str(record.get("kind", "")), pic_path,
+                        str(record.get("detail", "")),
+                        str(record.get("created_str", "")), target_key):
+                    break
+                self._dingtalk_drop(path)
+                sent += 1
+            if sent:
+                self.get_logger().warn(
+                    f"[dingtalk] 断网积压补发成功 {sent} 条")
+        finally:
+            self._dt_flush_lock.release()
+
+    def _dingtalk_drop(self, path: str) -> None:
+        """发送成功/文件损坏后删除队列项，删不掉只忽略。"""
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+
+    def _dingtalk_warn(self, msg: str) -> None:
+        """离线时避免每 30s 刷一条告警，5 分钟最多一条。"""
+        now = time.monotonic()
+        if now - self._dt_warn_last >= 300.0:
+            self._dt_warn_last = now
+            self.get_logger().warn(msg)
+
+    def _dingtalk_send(self, kind: str, pic_path: str, detail: str = "",
+                       ts_readable: str = "", target_key: str = "g1") -> bool:
+        """往指定群发一次钉钉，成功返回 True；失败返回 False 交回队列重试。
+
+        ts_readable 是异常发生的原始时间（补发时不能改成当前时间，
+        否则卡片上的时间会误导人）；为空时取当前时间。
+        target_key 对应 _dt_targets 里的群（g1=测试群，g2=正式群）。
+        """
+        target = self._dt_target_map.get(target_key)
+        if target is None:
+            return False
+        try:
             # 构建加签 URL
             timestamp_ms = str(int(time.time() * 1000))
-            string_to_sign = f"{timestamp_ms}\n{self._dingtalk_secret}"
+            string_to_sign = f"{timestamp_ms}\n{target['secret']}"
             hmac_code = hmac.new(
-                self._dingtalk_secret.encode("utf-8"),
+                target["secret"].encode("utf-8"),
                 string_to_sign.encode("utf-8"),
                 digestmod=hashlib.sha256).digest()
             sign = urllib.parse.quote_plus(base64.b64encode(hmac_code))
             url = (f"https://oapi.dingtalk.com/robot/send"
-                   f"?access_token={self._dingtalk_token}"
+                   f"?access_token={target['token']}"
                    f"&timestamp={timestamp_ms}&sign={sign}")
 
             # 构建 Markdown 消息
-            pic_name = os.path.basename(pic_path)
-            ts_readable = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
+            pic_name = os.path.basename(pic_path) if pic_path else ""
+            ts_readable = ts_readable or time.strftime(
+                "%Y-%m-%d %H:%M:%S", time.localtime())
             # POI_XX_abnormal / POI_XX_uncertain → 拆成 点位 + 类型
             facility = ""   # 从 detail 里解析具体设施（灭火器/安全指示牌）
             if "_abnormal" in kind:
@@ -1428,13 +1675,19 @@ class OrchestratorNode(Node):
                 poi = "—"
                 kind_label = kind
             title = f"🔥 巡检异常 | {poi} | {kind_label}"
+            # 先上传 OSS 拿公网签名 URL；失败则退回只显示文件名
+            img_url = self._oss_upload(pic_path) if pic_path else ""
+            pic_line = f"`{pic_name}`" if pic_name else "（图片未保留）"
             text = (
                 f"## {title}\n\n"
                 f"- **时间**：{ts_readable}\n"
                 f"- **点位**：{poi}\n"
                 f"- **类型**：{kind_label}\n"
-                f"- **抓拍图**：`{pic_name}`\n"
+                f"- **抓拍图**：{pic_line}\n"
             )
+            if img_url:
+                # 钉钉 Markdown 支持公网图片，7 天内可直接点开查看
+                text += f"\n![巡检抓拍]({img_url})\n"
             body = {
                 "msgtype": "markdown",
                 "markdown": {"title": title, "text": text},
@@ -1445,17 +1698,54 @@ class OrchestratorNode(Node):
             req = urllib.request.Request(
                 url, data=data, method="POST",
                 headers={"Content-Type": "application/json"})
-            with urllib.request.urlopen(req, timeout=3) as resp:
+            with urllib.request.urlopen(req, timeout=5) as resp:
                 result = json.loads(resp.read().decode("utf-8"))
                 if result.get("errcode") == 0:
                     self.get_logger().info(
-                        f"[dingtalk] {kind} 推送成功：{pic_name}")
-                else:
-                    self.get_logger().warn(
-                        f"[dingtalk] {kind} 推送失败：{result}")
+                        f"[dingtalk] {kind} 推送成功[{target['label']}]：{pic_name}")
+                    return True
+                self._dingtalk_warn(
+                    f"[dingtalk] {kind} 推送失败[{target['label']}]：{result}")
+                return False
         except Exception as exc:  # noqa: BLE001 - 钉钉失败不影响巡检
+            # 断网时这轮失败很正常，已落盘等补发，告警做 5 分钟节流
+            self._dingtalk_warn(
+                f"[dingtalk] {kind} 发送异常[{target['label']}]（已入队待补发）：{exc}")
+            return False
+
+    def _oss_upload(self, pic_path: str) -> str:
+        """上传抓拍图到阿里云 OSS，返回 7 天有效的公网签名 URL。
+
+        私有 Bucket 也能通过签名 URL 访问，不要求公共读；
+        上传或签名失败返回空串，调用方退回只发文件名。
+        该方法在钉钉推送的后台线程里执行，不阻塞巡检主流程。
+        """
+        if not self._oss_ready:
+            return ""
+        try:
+            import oss2  # 延迟导入：未装 SDK 时不影响节点启动
+        except ImportError:
             self.get_logger().warn(
-                f"[dingtalk] {kind} 发送异常：{exc}")
+                "[oss] 未安装 oss2（pip install --user oss2），本次只发文件名")
+            return ""
+        try:
+            endpoint = self._oss_endpoint
+            if not endpoint.startswith(("http://", "https://")):
+                endpoint = "https://" + endpoint
+            auth = oss2.Auth(self._oss_ak_id, self._oss_ak_secret)
+            bucket = oss2.Bucket(auth, endpoint, self._oss_bucket)
+            day = time.strftime("%Y%m%d", time.localtime())
+            key = f"{self._oss_key_prefix}/{day}/{os.path.basename(pic_path)}"
+            bucket.put_object_from_file(key, pic_path)
+            # 签名 URL 有效期与本地 7 天保留对齐
+            expire = max(60, int(self._oss_url_expire_s))
+            img_url = bucket.sign_url("GET", key, expire, slash_safe=True)
+            self.get_logger().info(f"[oss] 上传成功：{key}")
+            return img_url
+        except Exception as exc:  # noqa: BLE001 - 上传失败不影响巡检
+            self.get_logger().warn(
+                f"[oss] {os.path.basename(pic_path)} 上传失败：{exc}")
+            return ""
 
     # 设施英文类名 → 钉钉卡片上显示的中文
     _FACILITY_LABELS = {
@@ -2633,6 +2923,19 @@ class OrchestratorNode(Node):
             self.get_logger().warn(f"{poi} 视觉检查被 skip 指令取消，按跳过记录")
             return
 
+        # 将当前 POI 的视觉检查结果发布给 Dashboard Bridge
+        poi_msg = PoiResult()
+        poi_msg.header.stamp = self.get_clock().now().to_msg()
+        poi_msg.poi = poi
+        poi_msg.status = int(result.status)
+        poi_msg.simulated = bool(result.simulated)
+        poi_msg.detail = str(result.detail)
+        poi_msg.detections_json = str(result.detections_json)
+        self._poi_result_pub.publish(poi_msg)
+
+        self.get_logger().info(
+            f"[dashboard] 已发布 POI 检查结果：{poi}，status={result.status}"
+        )
         status_text = STATUS_CN.get(int(result.status), f"未知({result.status})")
         self._results[poi] = status_text
         if result.simulated:

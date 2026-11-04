@@ -25,9 +25,9 @@ conf_by_class:
 # 为空时沿用通用文案，绝不按 POI 名称猜测专用目标。
 pois:
   - name: POI_01
-    expect_classes: [fire_extinguisher, safety_sign]
+    expect_classes: [fire_extinguisher]   # 第一个点位只查灭火器
     abnormal_classes: [smoking]
-    focus_classes: []   # 待现场确认是否专查某类；当前留空走通用文案
+    focus_classes: []   # expect 已只含灭火器，留空即走灭火器固定文案
   - name: POI_02
     expect_classes: [safety_sign]
     abnormal_classes: [smoking]
