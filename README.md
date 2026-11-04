@@ -17,14 +17,18 @@ fire-inspection/
 
 ## 模型权重
 
-权重文件体积较大，**不提交到仓库**（见 `.gitignore`）。首次部署时把权重放到：
+权重文件体积较大，**不提交到仓库**（见 `.gitignore`）。首次部署时把权重放到 `models/`：
 
 ```
-models/fire_3cls_v2.pt
+models/fire_3cls_v2.pt                # 消防三分类（smoking / safety_sign / fire_extinguisher）
+models/person_yolov8n.pt              # 行人检测
+models/smoking_cigarette_yolo11m.pt   # 专用香烟检测
+models/person_pose_yolo11n.pt         # 吸烟姿态门控
 ```
 
 路径由 `fire_inspection_ws/src/fire_inspection_vision/config/vision.yaml` 的
-`model_path` 指定。权重缺失时视觉结果为 `NO_MODEL`，不会把点位判为正常。
+`model_path` / `person.model_path` / `cigarette.model_path` / `smoking_gate.model_path`
+分别指定。主模型缺失时视觉结果为 `NO_MODEL`，不会把点位判为正常。
 
 ## 平台依赖
 
@@ -39,7 +43,7 @@ source /home/nvidia/xos/setup.bash
 
 ## 当前状态
 
-导航（dry_run）、视觉检查、头部扫视已实现；语音与编排层仍为骨架。
+导航（dry_run + 实机运动）、视觉检查、头部扫视、语音、编排层与听觉告警均已实现。
 详见 [fire_inspection_ws/README.md](fire_inspection_ws/README.md) 的状态表。
 
 ## 许可证
