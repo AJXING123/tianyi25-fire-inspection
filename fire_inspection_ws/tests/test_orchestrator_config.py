@@ -69,11 +69,12 @@ def test_yaml_pois_have_focus_classes_key():
 
 
 @case
-def test_yaml_expect_abnormal_same_as_before():
-    """yaml 的 expect_classes / abnormal_classes 未被本批改动（纯增量）。"""
+def test_yaml_expect_abnormal_configured():
+    """yaml 的 expect_classes / abnormal_classes 与现场检查项一致。"""
     cfg = yaml.safe_load(open(YAML_PATH))
     pois = {p["name"]: p for p in cfg.get("pois", [])}
-    assert pois["POI_01"]["expect_classes"] == ["fire_extinguisher", "safety_sign"]
+    # 第一个点位只检查灭火器
+    assert pois["POI_01"]["expect_classes"] == ["fire_extinguisher"]
     assert pois["POI_01"]["abnormal_classes"] == ["smoking"]
     assert pois["POI_02"]["expect_classes"] == ["safety_sign"]
     assert pois["POI_03"]["expect_classes"] == ["safety_sign"]

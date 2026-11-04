@@ -24,6 +24,7 @@ from .events import (
     MANUAL_RESULT,
     MANUAL_START,
     MANUAL_STATE,
+    ALERT_EVENT,
     POI_RESULT,
     ROUND_FINISH,
     ROUND_START,
@@ -133,8 +134,15 @@ class IngestClient:
             f"/api/ingest/manual-inspections/{event['manual_id']}/finish", payload
         )
 
+    def add_alert_event(self, event: dict) -> dict:
+        payload = dict(event["payload"])
+        payload["event_id"] = event["event_id"]
+        return self._post("/api/ingest/events", payload)
+
     def dispatch(self, event: dict) -> dict:
         kind = event.get("kind")
+        if kind == ALERT_EVENT:
+            return self.add_alert_event(event)
         if kind == ROUND_START:
             return self.start_round(event)
         if kind == ROUND_STATE:

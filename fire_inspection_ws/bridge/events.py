@@ -8,6 +8,7 @@ ROUND_START = "round_start"
 ROUND_STATE = "round_state"
 POI_RESULT = "poi_result"
 ROUND_FINISH = "round_finish"
+ALERT_EVENT = "alert_event"
 
 # 手动点名检查事件：与自动巡检事件完全独立，键名用 manual_id
 MANUAL_START = "manual_start"
@@ -16,7 +17,7 @@ MANUAL_RESULT = "manual_result"
 MANUAL_FINISH = "manual_finish"
 
 MANUAL_KINDS = (MANUAL_START, MANUAL_STATE, MANUAL_RESULT, MANUAL_FINISH)
-EVENT_KINDS = (ROUND_START, ROUND_STATE, POI_RESULT, ROUND_FINISH) + MANUAL_KINDS
+EVENT_KINDS = (ROUND_START, ROUND_STATE, POI_RESULT, ROUND_FINISH, ALERT_EVENT) + MANUAL_KINDS
 
 
 def new_event(kind: str, ref_id: str, payload: dict, created_at: str) -> dict:

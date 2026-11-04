@@ -229,12 +229,38 @@ class ButtonTrigger(Node):
         operator = request.operator_id or "web"
 
         if not self.launch_stack:
+            # 常驻模式：网页与遥控器 B 键共用同一套 start/stop 控制逻辑。
+            if cmd == "start":
+                if self._state_active:
+                    response.success = False
+                    response.message = "巡检已经在运行"
+                    response.current_state = self._state_text or "running"
+                    return response
+
+                self.get_logger().info(f"网页请求启动巡检，操作人：{operator}")
+                self._request_start()
+                response.success = True
+                response.message = "已受理巡检启动请求"
+                response.current_state = self._state_text or "starting"
+                return response
+
+            if cmd == "stop":
+                if not self._state_active:
+                    response.success = True
+                    response.message = "当前没有正在运行的巡检"
+                    response.current_state = self._state_text or "idle"
+                    return response
+
+                self.get_logger().warn(f"网页请求停止巡检，操作人：{operator}")
+                self._request_stop()
+                response.success = True
+                response.message = "已受理停止请求，正在安全停止巡检"
+                response.current_state = self._state_text or "stopping"
+                return response
+
             response.success = False
-            response.message = (
-                "Launch 管理模式尚未启用，请将 button-trigger.service "
-                "设置为 launch_stack:=true"
-            )
-            response.current_state = self._state_text or "idle"
+            response.message = f"不支持的命令：{cmd}"
+            response.current_state = self._state_text or "unknown"
             return response
 
         if cmd == "start":

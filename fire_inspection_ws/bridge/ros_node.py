@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import logging
 import os
 import signal
@@ -33,6 +34,7 @@ from .gateway import (
 from .http_app import BridgeHttpServer
 from .manual_tracker import ManualMarker, ManualTracker
 from .outbox import EventOutbox, OutboxFull
+from .events import ALERT_EVENT, new_event
 from .round_tracker import RoundMarker, RoundTracker
 
 logger = logging.getLogger("bridge")
@@ -42,6 +44,7 @@ CONTROL_SERVICE = "/fire_inspection/control"
 STACK_CONTROL_SERVICE = "/fire_inspection/stack_control"
 # 正式点位结果话题：编排节点在 _inspect() 拿到 InspectPoi 结果后原样透传发布
 POI_RESULT_TOPIC = "/fire_inspection/poi_result"
+ALERT_EVENT_TOPIC = "/fire_inspection/event"
 
 
 def _utc_now() -> str:
@@ -102,6 +105,9 @@ class RosBridgeNode(Node, RosGateway):
         self._poi_sub = self.create_subscription(
             PoiResult, poi_topic, self._on_poi_result, 10
         )
+        self._alert_sub = self.create_subscription(
+            String, ALERT_EVENT_TOPIC, self._on_alert_event, 10
+        )
         self._control_client = self.create_client(InspectionControl, CONTROL_SERVICE)
         self._stack_client = self.create_client(
             InspectionControl, STACK_CONTROL_SERVICE
@@ -154,6 +160,21 @@ class RosBridgeNode(Node, RosGateway):
             )
             return
         self._publish_events([event])
+
+    def _on_alert_event(self, msg: String) -> None:
+        try:
+            payload = json.loads(msg.data)
+            if not isinstance(payload, dict):
+                raise ValueError("事件内容必须是 JSON 对象")
+            required = ("event_type", "source", "severity", "message")
+            if any(not isinstance(payload.get(k), str) or not payload[k].strip()
+                   for k in required):
+                raise ValueError("事件缺少必需的字符串字段")
+            event = new_event(ALERT_EVENT, "alerts", payload, _utc_now())
+            self._publish_events([event])
+            logger.info("异常事件已进入上传队列：%s", payload["event_type"])
+        except (ValueError, TypeError) as exc:
+            logger.warning("忽略格式错误的异常事件：%s", exc)
 
     def _publish_events(self, events: list[dict]) -> None:
         if not events:
