@@ -3,9 +3,10 @@
 从 tianyi_see/robot_test.py 抽取，去掉 GUI / CSV / 存图等调试逻辑，
 只保留「一帧图像 -> 结构化检出 -> PoiResult 语义」这条主链。
 
-阈值策略沿用现场实测结论：
-  - 吸烟 0.25：放宽阈值优先保证检出
+阈值策略沿用 2026-10-29 现场验收口径：
+  - 吸烟 0.45：0.25 会把站立人体误检当确定结论；0.60 会漏掉远处真目标
   - 安全指示牌 / 灭火器 0.65：收紧阈值压制误检
+  - 吸烟只按阈值判定，不做框几何校验（2026-10-31 引入后现场效果变差，已回退）
 """
 
 from __future__ import annotations
@@ -51,16 +52,26 @@ def canonical(name: str) -> str:
     return ALIASES.get(key, key)
 
 
+# 诊断用推理下限：低于所有判定阈值，只为了把「低分候选」暴露给上层日志，
+# 不影响最终采纳（filter 仍按类别阈值筛）。
+DIAG_MIN_CONF = 0.15
+
+
 class Detector:
     """YOLO 检测器：懒加载模型，单线程串行推理，超时即弃用实例。"""
 
-    def __init__(self, model_path, imgsz=1280, conf_smoking=0.25,
-                 conf_other=0.65, device="0"):
+    def __init__(self, model_path, imgsz=1280, conf_smoking=0.45,
+                 conf_other=0.65, device="0", keep_classes=None):
         self.model_path = str(model_path or "")
         self.imgsz = int(imgsz)
         self.conf_smoking = float(conf_smoking)
         self.conf_other = float(conf_other)
         self.device = str(device)
+        # 只保留这些类别（如人体模型只取 person）：None 表示不过滤。
+        # 通用 COCO 模型有 80 类，若不过滤会把无关类别一并发布给编排层。
+        self.keep_classes = (
+            {canonical(c) for c in keep_classes} if keep_classes else None
+        )
         self._model = None
         self.names = {}
         self._err = ""
@@ -98,7 +109,11 @@ class Detector:
         if not ok:
             return None, err, STATUS_NO_MODEL
 
-        infer_conf = min(self.conf_smoking, self.conf_other)
+        # 推理阈值比判定阈值更低（下限 DIAG_MIN_CONF）：让 0.15~阈值 之间的
+        # 候选也能出来，供上层打诊断日志（[diag] 原始最高 conf），
+        # 否则「模型没检出」和「检出了但分数不够」在日志里无法区分。
+        # 最终是否采纳仍由 filter() 按类别阈值决定，行为不变。
+        infer_conf = min(self.conf_smoking, self.conf_other, DIAG_MIN_CONF)
         future = self._pool.submit(self._predict, frame, infer_conf)
         try:
             dets = future.result(timeout=timeout_s) if timeout_s else future.result()
@@ -122,6 +137,9 @@ class Detector:
         for box in result.boxes:
             cls_id = int(box.cls)
             name = self.names.get(cls_id, str(cls_id))
+            if (self.keep_classes is not None
+                    and canonical(name) not in self.keep_classes):
+                continue
             x1, y1, x2, y2 = [float(v) for v in box.xyxy[0]]
             dets.append({
                 "cls": name,
@@ -141,7 +159,8 @@ class Detector:
 
     def filter(self, dets):
         """按每类阈值过滤（推理用的统一低阈值，这里再按类别收紧）。"""
-        return [d for d in dets if d["conf"] >= self.threshold_of(d["cls"])]
+        return [det for det in dets
+                if det["conf"] >= self.threshold_of(det["cls"])]
 
     def judge(self, dets, expect_classes, abnormal_classes):
         """返回 (status, detail)。结果保守：不确定绝不判正常。"""
@@ -167,12 +186,27 @@ class Detector:
 
     @staticmethod
     def to_json(dets, limit=20):
-        """按契约 §6.1 序列化：cls/conf/cx/cy/w/h，按 conf 降序，最多 limit 条。"""
+        """按契约 §6.1 序列化：cls/conf/cx/cy/w/h，按 conf 降序，最多 limit 条。
+
+        range_m / bearing_rad / range_valid / look_pitch_rad 为可选扩展字段
+        （吸烟人员介入用），由持续检测节点按深度与头部姿态补齐；
+        缺失时不写，保持旧 schema 兼容。
+        """
         ordered = sorted(dets, key=lambda d: d["conf"], reverse=True)[:limit]
-        return json.dumps(
-            [{"cls": d["cls"], "conf": round(d["conf"], 3),
-              "cx": round(d["cx"], 4), "cy": round(d["cy"], 4),
-              "w": round(d["w"], 4), "h": round(d["h"], 4)}
-             for d in ordered],
-            ensure_ascii=False, separators=(",", ":"),
-        )
+        items = []
+        for d in ordered:
+            item = {
+                "cls": d["cls"], "conf": round(d["conf"], 3),
+                "cx": round(d["cx"], 4), "cy": round(d["cy"], 4),
+                "w": round(d["w"], 4), "h": round(d["h"], 4),
+            }
+            if "range_m" in d:
+                item["range_m"] = round(float(d["range_m"]), 3)
+            if "bearing_rad" in d:
+                item["bearing_rad"] = round(float(d["bearing_rad"]), 4)
+            if "look_pitch_rad" in d:
+                item["look_pitch_rad"] = round(float(d["look_pitch_rad"]), 4)
+            if "range_valid" in d:
+                item["range_valid"] = bool(d["range_valid"])
+            items.append(item)
+        return json.dumps(items, ensure_ascii=False, separators=(",", ":"))

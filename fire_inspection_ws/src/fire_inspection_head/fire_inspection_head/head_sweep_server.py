@@ -199,6 +199,10 @@ class HeadSweepServer(Node):
     def look_at(self, yaw, pitch):
         self._look_target = [0.0, float(pitch), float(yaw)]
         self._ensure_worker("look")
+        # 打断正在进行的扫视步骤：move_to 的过渡/停留循环会立即返回，
+        # 下一拍就切到 look。否则要等整步（2s 过渡 + 2s 停留）走完才转向，
+        # 编排层 3s 确认窗口内锁头会失效，目标已经丢了。
+        self.adapter.stop_requested = True
         self.get_logger().info(f"看向 yaw={yaw:.3f} pitch={pitch:.3f} rad（关节限位内自动裁剪）")
 
     def center_look(self):
@@ -258,25 +262,33 @@ class HeadSweepServer(Node):
         # 停留期间 move_to 持续下发，防止第三方发布者抢走 /head/cmd
         self.adapter.move_to(pose, self.duration, self.dwell,
                              self.speed, self.current)
-        if self._stop_evt.is_set() or self._pause_evt.is_set():
+        # 被 look_at 打断时不推进步骤，恢复扫视后从这一步继续
+        if (self._stop_evt.is_set() or self._pause_evt.is_set()
+                or self._mode != "sweep"):
             return
         self._step_idx = (self._step_idx + 1) % len(self.steps)
 
     def _run_look(self):
-        target = list(self._look_target)
         if self._state != "looking":
             self._publish("looking")
-        self.adapter.stop_requested = False
-        self.adapter.move_to(target, self.look_duration, 0.0,
-                             self.speed, self.current)
-        if self._stop_evt.is_set() or self._mode != "look":
-            return
-        if self._state != "holding":
-            self._publish("holding")
-        # 保持到 resume / center / stop：既看得住目标，也压住第三方发布者
+        # 目标可能被连续的 look_at 更新，且新的 look_at 会把 stop_requested
+        # 置 True 打断上一轮 move_to；每轮循环重读目标，才能跟上最新指向。
         while not self._stop_evt.is_set() and self._mode == "look":
-            self.adapter.send(target, self.speed, self.current)
-            time.sleep(self.period)
+            target = list(self._look_target)
+            self.adapter.stop_requested = False
+            self.adapter.move_to(target, self.look_duration, 0.0,
+                                 self.speed, self.current)
+            if self._stop_evt.is_set() or self._mode != "look":
+                return
+            if self.adapter.stop_requested:
+                continue     # 被新的 look_at 打断，按新目标重来
+            if self._state != "holding":
+                self._publish("holding")
+            # 保持到 resume / center / stop：既看得住目标，也压住第三方发布者
+            while (not self._stop_evt.is_set() and self._mode == "look"
+                   and not self.adapter.stop_requested):
+                self.adapter.send(target, self.speed, self.current)
+                time.sleep(self.period)
 
     def _hold_current(self, state):
         if self._state != state:

@@ -31,8 +31,8 @@ from fire_inspection_voice.speech_texts import (  # noqa: E402
     parse_poi_focus,
 )
 
-# 与队友确认的逐类阈值口径：smoking 0.25 / 其他 0.65
-CONF = {"smoking": 0.25, "safety_sign": 0.65, "fire_extinguisher": 0.65}
+# 逐类阈值口径：smoking 0.45 / 其他 0.65（与 vision.yaml 保持单一来源）
+CONF = {"smoking": 0.45, "safety_sign": 0.65, "fire_extinguisher": 0.65}
 
 
 class R:
@@ -85,6 +85,17 @@ def test_frozen_speech_texts_literals():
         "警告，未检测到安全出口指示灯，请工作人员检查。"
     assert SPEECH_TEXTS["smoking"] == "警告，发现吸烟行为，请立即停止吸烟。"
     assert SPEECH_TEXTS["done"] == "本次消防巡检已完成。"
+
+
+@case
+def test_obstacle_speech_texts_literals():
+    """绕行相关新增文案逐字一致；受阻播报必须说明已停止并跳过点位。"""
+    assert SPEECH_TEXTS["nav_obstacle"] == \
+        "警告，前方有障碍，正在尝试绕行，请注意安全。"
+    assert SPEECH_TEXTS["nav_detour_ok"] == "已绕过障碍，继续巡检。"
+    assert SPEECH_TEXTS["nav_blocked"] == \
+        "警告，机器人行进受阻已停止，已跳过巡查点位，请工作人员检查现场通道。"
+    assert SPEECH_TEXTS["smoking_resume"] == "已避开吸烟人员并记录，继续巡检。"
 
 
 @case
@@ -161,13 +172,24 @@ def test_normal_focus_order_safety_sign_first():
 
 
 @case
-def test_normal_generic_text_no_fire_extinguisher_expect():
-    """期望不含灭火器且无 focus → 通用"均在位"文案（原逻辑可达路径）。"""
+def test_normal_generic_text_single_target_no_jun():
+    """单目标点位（每个点位只有一个安全出口）→ 通用文案不带"均"。"""
     t = build_speech_text("POI_03", R(PoiStatus.NORMAL,
                                       [det("safety_sign", 0.9)]),
                           expect_classes=("safety_sign",),
                           conf_by_class=CONF)
-    assert t == "POI_03检查完成，安全指示牌均在位，未发现异常"
+    assert t == "POI_03检查完成，安全指示牌在位，未发现异常"
+
+
+@case
+def test_normal_generic_text_two_targets_keep_jun():
+    """多目标点位仍保留"均在位"。"""
+    t = build_speech_text("POI_09", R(PoiStatus.NORMAL,
+                                      [det("a", 0.9), det("b", 0.9)]),
+                          expect_classes=("a", "b"),
+                          conf_by_class=CONF,
+                          class_cn={"a": "甲", "b": "乙"})
+    assert t == "POI_09检查完成，甲、乙均在位，未发现异常"
 
 
 @case
@@ -245,7 +267,7 @@ def test_abnormal_focus_smoking_plus_sign_missing_no_extinguisher():
 
 @case
 def test_abnormal_low_conf_smoking_no_warning():
-    """低置信度吸烟（0.1 < 0.25）不触发吸烟警告。"""
+    """低置信度吸烟（0.1 < 0.60）不触发吸烟警告。"""
     t = build_speech_text("POI_02", R(PoiStatus.ABNORMAL,
                                       [det("smoking", 0.1)]),
                           expect_classes=("fire_extinguisher",),
@@ -262,6 +284,177 @@ def test_abnormal_unmatched_fallback():
                           abnormal_classes=("smoking",),
                           conf_by_class=CONF)
     assert t == "警告，POI_02发现异常，请现场人员立即确认处理"
+
+
+# ── NORMAL 分支防御性校验：检测证据不足时绝不能报正常 ──────────────────
+
+def _assert_uncertain_not_normal(text, *expected_keywords):
+    """防御路径断言：必须含"不确定"或"人工复核"，绝不能含"检查正常"。"""
+    assert "检查正常" not in text, \
+        f"防御路径绝不能报正常，实际={text}"
+    assert ("不确定" in text or "人工复核" in text), \
+        f"防御路径应降级为不确定/人工复核，实际={text}"
+    for kw in expected_keywords:
+        assert kw in text, f"防御路径应提到'{kw}'，实际={text}"
+
+
+@case
+def test_normal_focus_empty_no_fe_in_dets_not_normal():
+    """空 focus + expect 含 FE + NORMAL + 仅 SS 检出 → 降级不确定，不报正常。"""
+    t = build_speech_text("POI_01", R(PoiStatus.NORMAL,
+                                       [det("safety_sign", 0.9)]),
+                          expect_classes=("fire_extinguisher", "safety_sign"),
+                          conf_by_class=CONF)
+    _assert_uncertain_not_normal(t, "灭火器")
+
+
+@case
+def test_normal_focus_empty_empty_dets_not_normal():
+    """空 focus + expect 含 FE + NORMAL + 空 detections → 降级不确定。"""
+    t = build_speech_text("POI_01", R(PoiStatus.NORMAL, []),
+                          expect_classes=("fire_extinguisher", "safety_sign"),
+                          conf_by_class=CONF)
+    _assert_uncertain_not_normal(t)
+
+
+@case
+def test_normal_focus_empty_fe_low_conf_not_normal():
+    """空 focus + expect 含 FE + NORMAL + FE 置信度 0.5 < 0.65 → 降级不确定。"""
+    t = build_speech_text("POI_01", R(PoiStatus.NORMAL,
+                                       [det("fire_extinguisher", 0.5),
+                                        det("safety_sign", 0.9)]),
+                          expect_classes=("fire_extinguisher", "safety_sign"),
+                          conf_by_class=CONF)
+    # FE 被 filter 掉，detections 里只剩 SS → 降级不确定，提 FE
+    _assert_uncertain_not_normal(t, "灭火器")
+
+
+@case
+def test_normal_focus_fe_no_fe_in_dets_not_normal():
+    """focus=[FE] + NORMAL + 空 detections → 降级不确定，不报正常。"""
+    t = build_speech_text("POI_X", R(PoiStatus.NORMAL, []),
+                          focus_classes=("fire_extinguisher",),
+                          conf_by_class=CONF)
+    _assert_uncertain_not_normal(t, "灭火器")
+
+
+@case
+def test_normal_focus_fe_only_ss_in_dets_not_normal():
+    """focus=[FE] + NORMAL + 仅 SS 检出 → 降级不确定。"""
+    t = build_speech_text("POI_X", R(PoiStatus.NORMAL,
+                                      [det("safety_sign", 0.9)]),
+                          focus_classes=("fire_extinguisher",),
+                          conf_by_class=CONF)
+    _assert_uncertain_not_normal(t, "灭火器")
+
+
+@case
+def test_normal_focus_ss_no_ss_in_dets_not_normal():
+    """focus=[SS] + NORMAL + 空 detections → 降级不确定。"""
+    t = build_speech_text("安全出口", R(PoiStatus.NORMAL, []),
+                          focus_classes=("safety_sign",),
+                          conf_by_class=CONF)
+    _assert_uncertain_not_normal(t, "安全指示牌")
+
+
+@case
+def test_normal_focus_ss_only_fe_in_dets_not_normal():
+    """focus=[SS] + NORMAL + 仅 FE 检出 → 降级不确定。"""
+    t = build_speech_text("安全出口", R(PoiStatus.NORMAL,
+                                        [det("fire_extinguisher", 0.9)]),
+                          focus_classes=("safety_sign",),
+                          conf_by_class=CONF)
+    _assert_uncertain_not_normal(t, "安全指示牌")
+
+
+@case
+def test_normal_detections_none_safe_no_crash():
+    """detections=None 绝不能崩溃，也不能报正常。"""
+    result = R(PoiStatus.NORMAL, [])
+    result.detections = None  # 强制 None，绕过 R.__init__
+    t = build_speech_text("POI_01", result,
+                          expect_classes=("fire_extinguisher",),
+                          conf_by_class=CONF)
+    _assert_uncertain_not_normal(t, "灭火器")
+
+
+@case
+def test_normal_detections_malformed_safe_no_crash():
+    """元素缺 class_name / confidence → 跳过异常项，不报正常。"""
+    t = build_speech_text("POI_01", R(PoiStatus.NORMAL,
+                                       [{"confidence": 0.9},   # 缺 class_name
+                                        {"class_name": "fire_extinguisher"},  # 缺 confidence
+                                        {"class_name": "fire_extinguisher",
+                                         "confidence": None}]),
+                          expect_classes=("fire_extinguisher",),
+                          conf_by_class=CONF)
+    # 全部元素被跳过 → 无达标 FE → 降级不确定
+    _assert_uncertain_not_normal(t, "灭火器")
+
+
+# ── 通用 NORMAL 分支 fallback 防御：items 非空但未全部达标时降级 ─────────
+
+@case
+def test_normal_generic_fallback_expect_ss_no_dets():
+    """expect=[SS] + NORMAL + 空 detections → 降级不确定，不报正常。"""
+    t = build_speech_text("POINT", R(PoiStatus.NORMAL, []),
+                          expect_classes=("safety_sign",),
+                          conf_by_class=CONF)
+    _assert_uncertain_not_normal(t, "安全指示牌")
+
+
+@case
+def test_normal_generic_fallback_expect_ss_dets_fe_only():
+    """expect=[SS] + NORMAL + 只有 FE 检出 → 降级不确定。"""
+    t = build_speech_text("POINT", R(PoiStatus.NORMAL,
+                                      [det("fire_extinguisher", 0.9)]),
+                          expect_classes=("safety_sign",),
+                          conf_by_class=CONF)
+    _assert_uncertain_not_normal(t, "安全指示牌")
+
+
+@case
+def test_normal_generic_fallback_expect_ss_low_conf():
+    """expect=[SS] + NORMAL + SS 0.5<0.65 → filter 后无达标 SS → 降级不确定。"""
+    t = build_speech_text("POINT", R(PoiStatus.NORMAL,
+                                      [det("safety_sign", 0.5)]),
+                          expect_classes=("safety_sign",),
+                          conf_by_class=CONF)
+    _assert_uncertain_not_normal(t, "安全指示牌")
+
+
+@case
+def test_normal_generic_items_empty_keeps_current_behavior():
+    """items 空（expect 空 + focus 空）→ 保留通用文案（无明确检查目标）。
+
+    这是业务规则待确认的场景：无 expect 时 speech_texts 不主动检查任何目标，
+    仅依赖视觉层 judge() 的判定。本测试锁定当前"保留通用文案"的行为。
+    """
+    t = build_speech_text("POINT", R(PoiStatus.NORMAL, []),
+                          expect_classes=(), focus_classes=(),
+                          conf_by_class=CONF)
+    assert t == "POINT检查完成，未发现异常"
+    # 允许含"未发现异常"——items 空 + 无异常检出 = 可接受的通用文案
+
+
+@case
+def test_normal_generic_items_empty_but_smoking_detected():
+    """items 空 + 有 smoking 检出 + NORMAL → 当前行为记录（超出本批范围）。
+
+    生产中视觉 judge() 对 smoking 检出会判 ABNORMAL（非 NORMAL），
+    所以这条路径不可达。但防御纵深上，speech_texts NORMAL 分支不检查
+    abnormal_classes——如果视觉层被绕过，这里会输出"未发现异常"。
+    本测试只记录当前行为，不尝试修复（上一批 AdvisorTool 标记为
+    "防御纵深缺口"，但本轮明确排除 abnormal 规则修改）。
+    """
+    t = build_speech_text("POINT", R(PoiStatus.NORMAL,
+                                      [det("smoking", 0.9)]),
+                          expect_classes=(), focus_classes=(),
+                          abnormal_classes=("smoking",),
+                          conf_by_class=CONF)
+    # 当前行为：items 空 → L191 "未发现异常"（不检查 abnormal_classes）
+    # 这条路径生产不可达（视觉会判 ABNORMAL），本测试仅记录当前行为
+    assert t == "POINT检查完成，未发现异常"
 
 
 # ── 不确定 / 失败态：绝不播确定性结论 ───────────────────────────────

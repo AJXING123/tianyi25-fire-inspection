@@ -16,10 +16,13 @@ from __future__ import annotations
 
 import ast
 import builtins
+import hashlib
 import os
 import sys
+import tempfile
 import threading
 import traceback
+import wave
 from contextlib import contextmanager
 from types import SimpleNamespace
 
@@ -67,29 +70,36 @@ class FakeCalls:
     script: query 响应的 status 序列（耗尽后回退 idle_status）；
     append_ok/append_none: 控制 append 成功/失败/调用无应答；
     fail_query: query 一律返回 None（调用超时）；
-    raise_on_stop: stop 调用时抛异常（验证 best-effort 不炸主流程）。
+    raise_on_stop: stop 调用时抛异常（验证 best-effort 不炸主流程）；
+    append_fail_times: 前 N 次 append 返回失败（验证缓存失败后回退云端）。
     """
 
     def __init__(self, script=(), append_ok=True, append_none=False,
-                 fail_query=False, idle_status="idle", raise_on_stop=False):
-        self.log = []
+                 fail_query=False, idle_status="idle", raise_on_stop=False,
+                 append_fail_times=0):
+        self.log = []        # (cmd, text, audio_id)，保持旧断言的三元组格式
+        self.types = []      # 与 log 平行的 msg_type（file / text）
         self.script = list(script)
         self.append_ok = append_ok
         self.append_none = append_none
         self.fail_query = fail_query
         self.idle_status = idle_status
         self.raise_on_stop = raise_on_stop
+        self.append_fail_times = append_fail_times
 
-    def __call__(self, cmd, text, audio_id=""):
-        if cmd == "stop":
-            if self.raise_on_stop:
-                raise RuntimeError("stop boom")
-            self.log.append((cmd, text, audio_id))
-            return SimpleNamespace(success=True, status="")
+    def __call__(self, cmd, text, audio_id="", msg_type=""):
+        if cmd == "stop" and self.raise_on_stop:
+            raise RuntimeError("stop boom")
         self.log.append((cmd, text, audio_id))
+        self.types.append(msg_type)
+        if cmd == "stop":
+            return SimpleNamespace(success=True, status="")
         if cmd == "append":
             if self.append_none:
                 return None
+            if self.append_fail_times > 0:
+                self.append_fail_times -= 1
+                return SimpleNamespace(success=False, status="busy")
             return SimpleNamespace(success=self.append_ok,
                                    status="ok" if self.append_ok else "busy")
         # query
@@ -137,8 +147,15 @@ class FakeGoal:
         self.terminals.append("canceled")
 
 
-def make_server(calls, ready=True, dry_run=False, timeout_s=30.0):
-    """绕过 Node.__init__ 构造实例，注入全部依赖。"""
+def make_server(calls, ready=True, dry_run=False, timeout_s=30.0,
+                cache_enabled=False, cache_dir="", cloud_ready=True,
+                cloud_wait=15.0):
+    """绕过 Node.__init__ 构造实例，注入全部依赖。
+
+    cloud_ready=None 表示「一旦探测云端网络就判定失败」——用于证明
+    命中本地缓存时完全不走网络。cloud_wait/cloud_host 也必须注入，
+    否则 _cloud_ready 会真的去连云端。
+    """
     inst = object.__new__(sas.SpeakActionServer)
     inst.get_logger = lambda: SimpleNamespace(
         info=lambda *a, **k: None,
@@ -153,15 +170,50 @@ def make_server(calls, ready=True, dry_run=False, timeout_s=30.0):
     inst.settle = 0.4
     inst.s_per_char = 0.22
     inst.min_duration = 1.5
+    inst.cache_enabled = cache_enabled
+    inst.cache_dir = cache_dir
+    inst.cloud_host = "cosyvoice.test.invalid"
+    inst.cloud_port = 9962
+    inst.cloud_wait = cloud_wait
+    if cloud_ready is None:
+        def _forbidden():
+            raise AssertionError("本次播报不应探测云端网络")
+        inst._cloud_ready = _forbidden
+    else:
+        inst._cloud_ready = (lambda: cloud_ready)
     inst.cli = FakeClient(ready)
     inst._exec_lock = threading.Lock()
     inst._call = calls
+    inst.speaking_flag = False
+    inst._speaking_pub = SimpleNamespace(publish=lambda *a, **k: None)
     return inst
 
 
-# playing→idle 防抖完成的标准脚本（text=2 字 → est=1.5s, settle=0.4s）：
-# 预查询 idle + playing×2 + idle×3（0.4s 防抖）
-DONE_SCRIPT = ["idle", "playing", "playing", "idle", "idle", "idle"]
+def _cache_key(text: str) -> str:
+    """与 speak_action_server._cache_file 相同的 sha1[:16] 命名规则。"""
+    return hashlib.sha1(text.encode("utf-8")).hexdigest()[:16]
+
+
+def _write_wav(path, seconds=2.0, rate=16000):
+    """按给定时长生成静音 PCM wav，供缓存命中用例使用。"""
+    with wave.open(str(path), "wb") as f:
+        f.setnchannels(1)
+        f.setsampwidth(2)
+        f.setframerate(rate)
+        f.writeframes(b"\x00\x00" * int(rate * seconds))
+
+
+def _append_types(calls):
+    return [ty for (cmd, _text, _aid), ty in zip(calls.log, calls.types)
+            if cmd == "append"]
+
+
+# 云端播放完成的标准脚本（text="你好" → est=1.5s、min_span=1.9s、settle=0.4s）：
+# 预查询 idle + playing×11（有效播放 2.0s ≥ 1.9s）+ idle×3（0.4s 防抖）
+DONE_SCRIPT = ["idle"] + ["playing"] * 11 + ["idle"] * 3
+
+# 本地缓存 2.0s wav：min_span = max(0.8, est*0.7)=1.4s → playing×9（1.6s）
+CACHE_DONE_SCRIPT = ["idle"] + ["playing"] * 9 + ["idle"] * 3
 
 
 # ── 用例 ────────────────────────────────────────────────────────────
@@ -217,7 +269,7 @@ def test_service_not_ready_rejected():
 @case
 def test_interrupt_order_stop_then_query_append():
     """interrupt=true：调用顺序必须是 stop → (预查询) → append。"""
-    calls = FakeCalls(script=["idle", "playing", "idle", "idle", "idle"])
+    calls = FakeCalls(script=DONE_SCRIPT)
     inst = make_server(calls)
     gh = FakeGoal("你好", interrupt=True)
     with fake_clock():
@@ -340,8 +392,7 @@ def test_feedback_phases_and_progress():
 @case
 def test_stop_exception_swallowed():
     """stop 调用异常不中断主流程（best-effort），播报仍正常完成。"""
-    calls = FakeCalls(script=["idle", "playing", "idle", "idle", "idle"],
-                      raise_on_stop=True)
+    calls = FakeCalls(script=DONE_SCRIPT, raise_on_stop=True)
     inst = make_server(calls)
     gh = FakeGoal("你好", interrupt=True)
     with fake_clock():
@@ -408,7 +459,7 @@ def test_concurrent_goal_mutex():
 @case
 def test_whitespace_text_stripped_before_tts():
     """前后空格在提交前剥离；纯空白由 Goal 校验拦截（边界行为）。"""
-    calls = FakeCalls(script=["idle", "playing", "idle", "idle", "idle"])
+    calls = FakeCalls(script=DONE_SCRIPT)
     inst = make_server(calls)
     gh = FakeGoal("  你好  ")
     with fake_clock():
@@ -432,14 +483,107 @@ def test_lock_released_after_timeout_paths():
             f"提前返回后锁未释放: {calls.log}"
 
 
+# ── 离线缓存 / 云端预检 / 失败提示音识别 ──────────────────────────
+
+@case
+def test_cache_hit_plays_local_file_without_network():
+    """命中本地缓存：type=file 播本地 wav，全程不探测云端网络。"""
+    text = "灭火器检查正常。"
+    with tempfile.TemporaryDirectory() as tmp:
+        _write_wav(os.path.join(tmp, _cache_key(text) + ".wav"), 2.0)
+        calls = FakeCalls(script=CACHE_DONE_SCRIPT)
+        # cloud_ready=None：一旦调用 _cloud_ready 就抛断言错误
+        inst = make_server(calls, cache_enabled=True, cache_dir=tmp,
+                           cloud_ready=None)
+        gh = FakeGoal(text)
+        with fake_clock():
+            r = inst._execute(gh)
+    assert r.success is True and r.state == "done"
+    assert "本地缓存" in r.message
+    assert _append_types(calls) == ["file"], calls.log
+    assert ("append", os.path.join(tmp, _cache_key(text) + ".wav"),
+            AUDIO_ID) in calls.log
+
+
+@case
+def test_cache_miss_falls_back_to_cloud_text():
+    """缓存开启但未命中：仍走云端合成（type=text）。"""
+    with tempfile.TemporaryDirectory() as tmp:
+        calls = FakeCalls(script=DONE_SCRIPT)
+        inst = make_server(calls, cache_enabled=True, cache_dir=tmp)
+        gh = FakeGoal("你好")
+        with fake_clock():
+            r = inst._execute(gh)
+    assert r.success is True and r.state == "done"
+    assert _append_types(calls) == ["text"], calls.log
+
+
+@case
+def test_cache_playback_failure_falls_back_to_cloud():
+    """缓存播放未确认（append 失败）→ 回退云端再次提交。"""
+    text = "灭火器检查正常。"
+    # 第 1 次 append（file）失败；随后云端：预查询 1 条 + playing×11 + idle×3
+    script = (["idle"] + ["playing"]
+              + ["playing"] * 11 + ["idle"] * 3)
+    with tempfile.TemporaryDirectory() as tmp:
+        _write_wav(os.path.join(tmp, _cache_key(text) + ".wav"), 2.0)
+        calls = FakeCalls(script=script, append_fail_times=1)
+        inst = make_server(calls, cache_enabled=True, cache_dir=tmp)
+        gh = FakeGoal(text)
+        with fake_clock():
+            r = inst._execute(gh)
+    assert r.success is True and r.state == "done"
+    # 先 file（缓存），失败后 text（云端）
+    assert _append_types(calls) == ["file", "text"], calls.log
+
+
+@case
+def test_short_playback_detected_as_tts_failed_after_retry():
+    """有效播放过短（疑似 tts_failed.wav）→ 重试一次后 state=tts_failed。"""
+    # 每次尝试：预查询 + playing×3（span=0.4s < 下界 1.9s）+ idle×3
+    one_attempt = ["idle"] + ["playing"] * 3 + ["idle"] * 3
+    calls = FakeCalls(script=one_attempt * 2)
+    inst = make_server(calls)
+    gh = FakeGoal("你好")
+    with fake_clock():
+        r = inst._execute(gh)
+    assert r.success is False and r.state == "tts_failed"
+    assert "失败提示音" in r.message
+    assert len([c for c in calls.log if c[0] == "append"]) == 2
+    assert gh.terminals == ["abort"]
+
+
+@case
+def test_cloud_unreachable_skips_playback_without_failed_tone():
+    """云端不可达：先反馈 waiting_network，超时后跳过播报，不提交失败提示音。"""
+    calls = FakeCalls(script=DONE_SCRIPT)
+    inst = make_server(calls, cloud_ready=False, cloud_wait=0.5)
+    gh = FakeGoal("你好")
+    with fake_clock() as ft:
+        r = inst._execute(gh)
+    assert r.success is False and r.state == "tts_failed"
+    assert "waiting_network" in [p for _, p in gh.feedbacks]
+    # 不提交任何播放请求（避免平台播放 tts_failed.wav 干扰巡检）
+    assert [c for c in calls.log if c[0] == "append"] == []
+    # 只等到 wait_s 就放弃，不会无限等网络
+    assert ft.now <= 0.5 + 5.0, f"等待网络过久: ft.now={ft.now}"
+
+
 # ── P1 回归：构造路径真实执行 + 全局名静态检查 ──────────────────────
 
 def _ast_bound_target(node, out):
-    """递归收集赋值目标绑定的名字（Attribute/Subscript 不引入新名）。"""
+    """递归收集赋值目标绑定的名字（Attribute/Subscript 不引入新名）。
+
+    需同时处理 ast.Tuple/ast.List（多返回值解包，如
+    `outcome, detail, span, total = ...`），否则会误报未定义名。
+    """
     if isinstance(node, ast.Name):
         out.add(node.id)
     elif isinstance(node, ast.Starred):
         _ast_bound_target(node.value, out)
+    elif isinstance(node, (ast.Tuple, ast.List)):
+        for item in node.elts:
+            _ast_bound_target(item, out)
     elif isinstance(node, (list, tuple)):
         for item in node:
             _ast_bound_target(item, out)
@@ -492,7 +636,8 @@ def test_real_constructor_runs_offline():
     node_cls = sas.Node
     saved = {k: node_cls.__dict__[k] for k in
              ("__init__", "declare_parameter", "get_parameter",
-              "create_client", "get_logger") if k in node_cls.__dict__}
+              "create_client", "create_publisher", "get_logger")
+             if k in node_cls.__dict__}
     declared = {}
 
     def _fake_init(self, name, **kw):
@@ -507,6 +652,9 @@ def test_real_constructor_runs_offline():
     def _fake_client(self, srv_type, srv_name, **kw):
         return FakeClient(True)
 
+    def _fake_pub(self, msg_type, topic, qos=10, **kw):
+        return SimpleNamespace(publish=lambda *a, **k: None)
+
     def _fake_logger(self):
         return SimpleNamespace(
             info=lambda *a, **k: None,
@@ -520,6 +668,7 @@ def test_real_constructor_runs_offline():
     node_cls.declare_parameter = _fake_declare
     node_cls.get_parameter = _fake_get
     node_cls.create_client = _fake_client
+    node_cls.create_publisher = _fake_pub
     node_cls.get_logger = _fake_logger
     try:
         inst = sas.SpeakActionServer()  # 真实签名无参，节点名硬编码
@@ -534,6 +683,11 @@ def test_real_constructor_runs_offline():
     assert inst.audio_id == AUDIO_ID
     assert inst.timeout == 30.0
     assert inst.tts == "/intelligent_interaction/tts/play"
+    # 离线缓存与云端预检参数同样必须在真实构造中落地
+    assert inst.cache_enabled is True
+    assert inst.cache_dir == ""
+    assert inst.cloud_port == 9962
+    assert inst.cloud_wait == 15.0
     lock = getattr(inst, "_exec_lock", None)
     assert lock is not None and hasattr(lock, "acquire"), \
         "_exec_lock 未在真实构造中创建（P1 类缺陷）"

@@ -1,0 +1,32 @@
+[Unit]
+Description=Fire Inspection Full Stack (ty2.5)
+# 开机拉起唯一一份完整巡检链路（头部 / 导航 / 语音 / 视觉 / 听觉 / 编排层）。
+# 编排层 auto_start=false：服务常驻，等待网页或遥控器 B 键经
+# /fire_inspection/control 发送 start/stop。
+# 必须等底盘控制栈和平台进程管理器起来，否则导航/头部无接收端。
+After=network-online.target robot-control.service proc_manager.service
+Wants=network-online.target robot-control.service proc_manager.service
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+User=nvidia
+Group=nvidia
+Environment=HOME=/home/nvidia
+Environment=ROS_LOG_DIR=/home/nvidia/logs/ros
+Environment=PYTHONUNBUFFERED=1
+WorkingDirectory=/home/nvidia/fire-inspection/fire_inspection_ws
+ExecStartPre=/bin/mkdir -p /home/nvidia/logs/ros
+# dry_run=false：真机（真导航 / 真推理 / 真播报），启动前确认车在巡检起点、
+# 周围无人、急停可达；服务本身不会自动开跑。
+# start_head=true：头部由本链路统一拉起，使用全链路后不要再启用
+# head-sweep.service，避免两个节点同时下发 /head/cmd。
+ExecStart=/bin/bash -c 'source /opt/ros/jazzy/setup.bash && source /home/nvidia/xos/setup.bash && source /home/nvidia/fire-inspection/fire_inspection_ws/install/setup.bash && exec ros2 launch fire_inspection_orchestrator inspection_bringup.launch.py dry_run:=false start_head:=false start_audio:=true auto_start:=false nav_enabled:=true'
+Restart=on-failure
+RestartSec=10
+# 正常停止时由 ros2 launch 依次收掉子节点（导航会停车并回滚限速），给足时间
+KillSignal=SIGINT
+TimeoutStopSec=60
+
+[Install]
+WantedBy=multi-user.target

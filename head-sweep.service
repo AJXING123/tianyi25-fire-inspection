@@ -1,0 +1,18 @@
+[Unit]
+Description=Safety Patrol Head Sweep (look_around --loop)
+# 等系统基础目标起来再启动，避免和机器人主栈抢启动
+After=default.target
+
+[Service]
+Type=simple
+WorkingDirectory=/home/nvidia
+# 必须显式 source ROS 与机器人栈，否则找不到 ros2_bridge_msgs
+ExecStart=/bin/bash -lc 'source /opt/ros/jazzy/setup.bash && source /home/nvidia/xos/setup.bash && exec python3 /home/nvidia/look_around.py --loop'
+# 手柄 G+E 正常停止时进程会自己退出，不要自动拉起
+Restart=no
+# 让 systemd 发 SIGINT，脚本能走 KeyboardInterrupt 分支干净退出
+KillSignal=SIGINT
+TimeoutStopSec=10
+
+[Install]
+WantedBy=default.target

@@ -1,0 +1,267 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>天轶 2.5 消防巡检后台</title>
+  <link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">
+      <span class="brand-mark">TY</span>
+      <div>
+        <h1>天轶 2.5 消防巡检后台</h1>
+        <p class="subtitle">第三阶段 · 巡检 / 异常事件 / 模拟联调</p>
+      </div>
+    </div>
+    <div class="topbar-right">
+      <span id="robot-badge" class="badge badge-muted">状态检查中…</span>
+      <button id="refresh-btn" class="btn btn-ghost" type="button">刷新</button>
+      <button id="logout-btn" class="btn btn-ghost" type="button" title="退出当前登录会话">退出登录</button>
+    </div>
+  </header>
+
+  <main>
+    <div id="global-error" class="banner banner-error" role="alert" hidden>
+      <span id="global-error-text"></span>
+      <button id="retry-btn" class="btn btn-small" type="button">重试</button>
+    </div>
+    <div id="demo-banner" class="banner banner-demo" hidden>
+      当前页面包含 <strong>演示数据（demo）</strong>，仅用于界面验证，不是真实巡检结果。
+    </div>
+
+    <section class="panel" id="status-panel">
+      <div class="panel-head">
+        <h2>当前巡检状态</h2>
+        <span id="status-updated" class="muted small"></span>
+      </div>
+      <div id="status-loading" class="placeholder">加载中…</div>
+      <div id="status-empty" class="placeholder" hidden>
+        当前没有进行中的巡检任务。机器人离线时，页面不会显示伪造的在线状态或巡检结果。
+      </div>
+      <div id="status-content" hidden>
+        <div class="status-grid">
+          <div class="stat"><span class="stat-label">巡检状态</span><strong id="st-status">—</strong></div>
+          <div class="stat"><span class="stat-label">轮次编号</span><strong id="st-round" class="mono">—</strong></div>
+          <div class="stat"><span class="stat-label">数据来源</span><strong id="st-source">—</strong></div>
+          <div class="stat"><span class="stat-label">操作人</span><strong id="st-operator">—</strong></div>
+          <div class="stat"><span class="stat-label">开始时间</span><strong id="st-started">—</strong></div>
+          <div class="stat"><span class="stat-label">已记录点位</span><strong id="st-recorded">—</strong></div>
+        </div>
+        <div id="progress-wrap" class="progress-wrap" hidden>
+          <div class="progress-head">
+            <span class="muted small">巡检进度</span>
+            <strong id="progress-text" class="small">—</strong>
+          </div>
+          <div class="progress-track"><div id="progress-bar" class="progress-bar"></div></div>
+        </div>
+        <p id="st-ros-state" class="mono small muted"></p>
+        <p id="st-offline-note" class="notice" hidden></p>
+      </div>
+    </section>
+
+    <section class="panel">
+      <div class="panel-head">
+        <h2>巡检控制</h2>
+        <span class="muted small">指令对应 /fire_inspection/control 服务</span>
+      </div>
+      <div class="control-row">
+        <input id="arg-input" class="input" type="text" maxlength="64"
+               placeholder="点位参数 arg（skip / manual 用，可留空）">
+        <input id="operator-input" class="input" type="text" maxlength="32"
+               placeholder="操作人（可选）">
+      </div>
+      <div class="buttons">
+        <button class="btn btn-primary" data-cmd="start" type="button">开始巡检</button>
+        <button class="btn" data-cmd="pause" type="button">暂停</button>
+        <button class="btn" data-cmd="resume" type="button">继续</button>
+        <button class="btn" data-cmd="skip" type="button">跳过当前点</button>
+        <button class="btn btn-danger" data-cmd="stop" type="button">停止</button>
+      </div>
+      <p id="control-note" class="notice"></p>
+      <p id="control-feedback" class="feedback" hidden></p>
+    </section>
+
+    <section class="panel">
+      <div class="panel-head">
+        <h2>当前轮巡检点结果</h2>
+        <span id="poi-count" class="muted small"></span>
+      </div>
+      <div class="table-wrap">
+        <table class="data-table">
+          <thead>
+            <tr><th>#</th><th>点位</th><th>结果</th><th>说明</th><th>检测数据</th><th>时间</th></tr>
+          </thead>
+          <tbody id="poi-body"></tbody>
+        </table>
+        <p id="poi-empty" class="placeholder" hidden>当前轮次还没有巡检点结果。</p>
+      </div>
+    </section>
+
+    <section class="panel" id="events-panel">
+      <div class="panel-head">
+        <h2>异常事件</h2>
+        <div class="filters">
+          <select id="filter-event-type" class="input">
+            <option value="">全部类型</option>
+            <option value="alarm_detected">防空警报</option>
+            <option value="vision_abnormal">视觉异常</option>
+            <option value="voice_broadcast">语音播报</option>
+            <option value="comm_failure">通信异常</option>
+            <option value="comm_restored">通信恢复</option>
+          </select>
+          <select id="filter-event-severity" class="input">
+            <option value="">全部级别</option>
+            <option value="critical">严重</option>
+            <option value="warning">警告</option>
+            <option value="info">提示</option>
+          </select>
+          <select id="filter-event-status" class="input">
+            <option value="">全部处理状态</option>
+            <option value="open">待处理</option>
+            <option value="acknowledged">已确认</option>
+            <option value="resolved">已解决</option>
+          </select>
+        </div>
+      </div>
+      <div class="table-wrap">
+        <table class="data-table">
+          <thead>
+            <tr>
+              <th>时间</th><th>类型</th><th>级别</th><th>来源</th>
+              <th>说明</th><th>处理状态</th><th>关联</th>
+            </tr>
+          </thead>
+          <tbody id="events-body"></tbody>
+        </table>
+        <p id="events-empty" class="placeholder" hidden>
+          暂无异常事件。防空警报、视觉异常、语音播报与通信异常都会出现在这里。
+        </p>
+        <p id="events-error" class="placeholder" hidden></p>
+      </div>
+      <div class="pager">
+        <button id="events-prev" class="btn btn-small" type="button" disabled>上一页</button>
+        <span id="events-page-info" class="muted small">第 1 页</span>
+        <button id="events-next" class="btn btn-small" type="button" disabled>下一页</button>
+      </div>
+    </section>
+
+    <section class="panel">
+      <div class="panel-head">
+        <h2>历史巡检记录</h2>
+        <div class="filters">
+          <select id="filter-status" class="input">
+            <option value="">全部状态</option>
+            <option value="running">进行中</option>
+            <option value="completed">已完成</option>
+            <option value="stopped">已停止</option>
+            <option value="aborted">已中止</option>
+          </select>
+          <select id="filter-outcome" class="input">
+            <option value="">全部结果</option>
+            <option value="normal">正常完成</option>
+            <option value="abnormal">存在异常</option>
+            <option value="uncertain">结果不确定</option>
+          </select>
+          <select id="filter-source" class="input">
+            <option value="">全部来源</option>
+            <option value="real">真实</option>
+            <option value="demo">演示</option>
+            <option value="simulated">模拟</option>
+          </select>
+        </div>
+      </div>
+      <div class="table-wrap">
+        <table class="data-table">
+          <thead>
+            <tr>
+              <th>轮次</th><th>开始时间</th><th>状态</th><th>结果</th>
+              <th>点位</th><th>操作人</th><th>来源</th>
+            </tr>
+          </thead>
+          <tbody id="rounds-body"></tbody>
+        </table>
+        <p id="rounds-empty" class="placeholder" hidden>
+          暂无历史巡检记录。离线阶段可运行 <code>python -m app.seed_demo</code> 写入演示数据。
+        </p>
+      </div>
+      <div class="pager">
+        <button id="prev-page" class="btn btn-small" type="button" disabled>上一页</button>
+        <span id="page-info" class="muted small">第 1 页</span>
+        <button id="next-page" class="btn btn-small" type="button" disabled>下一页</button>
+      </div>
+    </section>
+
+    <section class="panel" id="manual-panel">
+      <div class="panel-head">
+        <h2>手动点名检查记录</h2>
+        <div class="filters">
+          <select id="filter-manual-status" class="input">
+            <option value="">全部状态</option>
+            <option value="running">进行中</option>
+            <option value="completed">已完成</option>
+            <option value="stopped">已停止</option>
+            <option value="aborted">已中止</option>
+          </select>
+        </div>
+      </div>
+      <div class="table-wrap">
+        <table class="data-table">
+          <thead>
+            <tr>
+              <th>点位</th><th>检查结果</th><th>执行状态</th>
+              <th>操作人</th><th>检查时间</th><th>说明 / 异常</th>
+            </tr>
+          </thead>
+          <tbody id="manual-body"></tbody>
+        </table>
+        <p id="manual-empty" class="placeholder" hidden>
+          暂无手动点名检查记录。手动检查与上方自动巡检历史完全分开统计。
+        </p>
+        <p id="manual-error" class="placeholder" hidden></p>
+      </div>
+      <div class="pager">
+        <button id="manual-prev" class="btn btn-small" type="button" disabled>上一页</button>
+        <span id="manual-page-info" class="muted small">第 1 页</span>
+        <button id="manual-next" class="btn btn-small" type="button" disabled>下一页</button>
+      </div>
+    </section>
+
+    <section class="panel dev-panel" id="dev-panel" hidden>
+      <div class="panel-head">
+        <h2>开发模拟联调 <span class="pill pill-demo">开发用途</span></h2>
+        <span class="muted small">仅在 FIRE_DASHBOARD_DEV_MODE=1 时出现</span>
+      </div>
+      <p class="notice">
+        下列场景写入的都是模拟数据（轮次 source=simulated、事件 simulated=1），
+        用于验证页面与事件链路，<strong>不代表真实机器人行为</strong>。
+      </p>
+      <div id="dev-buttons" class="buttons"></div>
+      <p id="dev-feedback" class="feedback" hidden></p>
+    </section>
+  </main>
+
+  <div id="detail-modal" class="modal" hidden>
+    <div class="modal-card" role="dialog" aria-modal="true" aria-label="巡检详情">
+      <div class="modal-head">
+        <h2>巡检详情</h2>
+        <button id="modal-close" class="btn btn-ghost" type="button">关闭</button>
+      </div>
+      <div id="modal-body" class="modal-body"></div>
+    </div>
+  </div>
+
+  <div id="event-modal" class="modal" hidden>
+    <div class="modal-card" role="dialog" aria-modal="true" aria-label="事件详情">
+      <div class="modal-head">
+        <h2>事件详情</h2>
+        <button id="event-modal-close" class="btn btn-ghost" type="button">关闭</button>
+      </div>
+      <div id="event-modal-body" class="modal-body"></div>
+    </div>
+  </div>
+
+  <script src="/app.js"></script>
+</body>
+</html>

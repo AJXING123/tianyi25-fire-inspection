@@ -12,10 +12,6 @@ __pycache__/
 venv/
 
 # 模型权重：不入库，机器人上手工放到 models/（见 README）
-models/*.pt
-models/*.onnx
-models/*.engine
-models/*.pth
 
 # 编辑器与系统文件
 .vscode/
@@ -28,3 +24,27 @@ Thumbs.db
 # 临时日志与打包产物
 *.log
 *.zip
+
+# 敏感凭证：钉钉机器人 webhook token + 加签密钥
+dingtalk.env
+# 本地环境和敏感配置
+.env
+.env.*
+!.env.example
+*.secret
+# Python 虚拟环境
+# 运行缓存、备份和日志
+audio_cache/
+backups/
+backup-units/
+logs/
+inspection_records/
+# ROS 运行队列和临时数据
+fire_inspection_ws/data/bridge/outbox.json
+# Python 备份文件
+*.bak
+# 网页运行数据库
+*.db
+*.sqlite
+*.sqlite3
+test_dingtalk.py

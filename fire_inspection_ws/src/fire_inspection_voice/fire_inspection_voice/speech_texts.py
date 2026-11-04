@@ -57,6 +57,7 @@ CLASS_CN = {
     "smoking": "吸烟行为",
     "safety_sign": "安全指示牌",
     "fire_extinguisher": "灭火器",
+    "person": "行人",
 }
 
 # ── 固定中文播报文本（唯一来源）────────────────────────────────────
@@ -70,6 +71,14 @@ SPEECH_TEXTS = {
     "safety_sign_ok": "安全出口指示灯检查正常。",
     "safety_sign_missing": "警告，未检测到安全出口指示灯，请工作人员检查。",
     "smoking": "警告，发现吸烟行为，请立即停止吸烟。",
+    "smoking_resume": "已避开吸烟人员并记录，继续巡检。",
+    # 途中发现行人：先播报让行提示，再侧向绕开，最后告知继续巡检
+    "person": "请让一下，机器人正在执行巡检任务。",
+    "person_resume": "已避让行人，继续巡检。",
+    "air_raid": "检测到防空警报响起，请大家立即撤离。",
+    "nav_obstacle": "警告，前方有障碍，正在尝试绕行，请注意安全。",
+    "nav_detour_ok": "已绕过障碍，继续巡检。",
+    "nav_blocked": "警告，机器人行进受阻已停止，已跳过巡查点位，请工作人员检查现场通道。",
     "done": "本次消防巡检已完成。",
 }
 
@@ -91,14 +100,46 @@ def _cn(name: str, class_cn: dict) -> str:
 
 def _strong_detections(result: Any, min_conf: float,
                        conf_by_class: Optional[dict]) -> list:
-    """按与判定层相同的阈值语义过滤达标检出。"""
+    """按与判定层相同的阈值语义过滤达标检出。
+
+    安全处理 detections=None、元素字段缺失或置信度非数值等异常输入，
+    绝不抛出 TypeError / AttributeError。
+    """
     out = []
-    for d in result.detections:
+    dets = getattr(result, "detections", None)
+    if not dets:
+        return out
+    for d in dets:
         cls = _field(d, "class_name")
-        thr = (conf_by_class or {}).get(cls, min_conf)
-        if _field(d, "confidence") >= thr:
-            out.append(d)
+        if not cls:
+            continue
+        conf = _field(d, "confidence")
+        if conf is None:
+            continue
+        try:
+            thr = (conf_by_class or {}).get(cls, min_conf)
+            if float(conf) >= float(thr):
+                out.append(d)
+        except (TypeError, ValueError):
+            continue
     return out
+
+
+def _uncertain_text(name: str, found_en: set, focus: tuple,
+                    expect_classes: Sequence[str],
+                    cn: dict) -> str:
+    """生成 UNCERTAIN 风格的人工复核提示（内部辅助）。
+
+    接收已达标的 found_en（英文类名集合），计算缺失目标并生成文本。
+    供 status=UNCERTAIN 分支和 NORMAL 分支校验失败时复用，
+    避免两处复制相同的缺失计算逻辑。
+    """
+    target_classes = focus or tuple(expect_classes)
+    missing = [_cn(c, cn) for c in target_classes if c not in found_en]
+    if missing:
+        return (f"{name}检查结果不确定，未能确认"
+                f"{'、'.join(missing)}，请人工复核")
+    return f"{name}检查结果不确定，请人工复核"
 
 
 def build_speech_text(poi_name: str, result: Any,
@@ -126,19 +167,48 @@ def build_speech_text(poi_name: str, result: Any,
     focus = tuple(focus_classes)
 
     if status == PoiStatus.NORMAL:
-        # 专用检查点：只播该点位的专用正常文本
-        if "safety_sign" in focus:
-            return SPEECH_TEXTS["safety_sign_ok"]
-        if "fire_extinguisher" in focus:
-            return SPEECH_TEXTS["extinguisher_ok"]
-        # 未配置专用目标：保持原有全局口径（灭火器期望 → 固定文本）
-        if not focus and "fire_extinguisher" in expect_classes:
-            return SPEECH_TEXTS["extinguisher_ok"]
+        # 先安全过滤达标检出：None / 字段缺失 / 非法置信度已在 _strong_detections 内处理
         strong = _strong_detections(result, min_conf, conf_by_class)
-        found = {_cn(_field(d, "class_name"), cn) for d in strong}
-        items = [_cn(c, cn) for c in (focus or tuple(expect_classes))]
-        if items and all(i in found for i in items):
-            return f"{name}检查完成，{'、'.join(items)}均在位，未发现异常"
+        found_en = {_field(d, "class_name") for d in strong}  # 英文类名集合
+
+        # ── 三个专用 / 固定正常播报分支都必须校验 detections 证据 ──
+        # 禁止仅凭 status=NORMAL 就播报"正常"；上游视觉判定已足够保守，
+        # 此处防御性校验用来阻断检测结果与状态矛盾时的假阳性播报。
+
+        if "safety_sign" in focus:
+            if "safety_sign" in found_en:
+                return SPEECH_TEXTS["safety_sign_ok"]
+            # focus 指定了安全指示牌但 detections 无法证明其存在 → 降级为不确定
+            return _uncertain_text(name, found_en, focus, expect_classes, cn)
+
+        if "fire_extinguisher" in focus:
+            if "fire_extinguisher" in found_en:
+                return SPEECH_TEXTS["extinguisher_ok"]
+            return _uncertain_text(name, found_en, focus, expect_classes, cn)
+
+        if not focus and "fire_extinguisher" in expect_classes:
+            if "fire_extinguisher" in found_en:
+                return SPEECH_TEXTS["extinguisher_ok"]
+            # 视觉判 NORMAL 但 detections 里没有灭火器 → 降级为不确定
+            return _uncertain_text(name, found_en, focus, expect_classes, cn)
+
+        # 通用分支：fall through 到此处说明三个 early-return 分支都未命中或校验失败
+        found_cn = {_cn(c, cn) for c in found_en}
+        target_classes = focus or tuple(expect_classes)
+        items = [_cn(c, cn) for c in target_classes]
+
+        # items 非空且全部达标 → 正常文本（已有 detections 校验）
+        # 单目标点位（如每个点位只有一个安全出口灯）不用"均"，避免语病
+        if items and all(i in found_cn for i in items):
+            joined = "、".join(items)
+            ok_word = "均在位" if len(items) > 1 else "在位"
+            return f"{name}检查完成，{joined}{ok_word}，未发现异常"
+
+        # items 非空但未全部达标 → 降级为不确定（防御纵深：目标未能确认，不能仅凭 status=NORMAL 就说"未发现异常"）
+        if items:
+            return _uncertain_text(name, found_en, focus, expect_classes, cn)
+
+        # items 空（focus 空 + expect 空）→ 无明确检查目标，保留通用文案
         return f"{name}检查完成，未发现异常"
 
     if status == PoiStatus.ABNORMAL:
@@ -170,13 +240,8 @@ def build_speech_text(poi_name: str, result: Any,
 
     if status == PoiStatus.UNCERTAIN:
         strong = _strong_detections(result, min_conf, conf_by_class)
-        found = {_field(d, "class_name") for d in strong}
-        missing = [_cn(c, cn) for c in (focus or tuple(expect_classes))
-                   if c not in found]
-        if missing:
-            return (f"{name}检查结果不确定，未能确认"
-                    f"{'、'.join(missing)}，请人工复核")
-        return f"{name}检查结果不确定，请人工复核"
+        found_en = {_field(d, "class_name") for d in strong}
+        return _uncertain_text(name, found_en, focus, expect_classes, cn)
 
     if status == PoiStatus.NO_FRAME:
         return f"{name}未能获取相机图像，检查未完成，请人工检查"
