@@ -6,10 +6,13 @@
 用法：
     ros2 launch fire_inspection_vision inspect.launch.py                 # dry_run=true，仅验证链路
     ros2 launch fire_inspection_vision inspect.launch.py dry_run:=false  # 真推理
+    ros2 launch fire_inspection_vision inspect.launch.py start_scan:=true  # 额外起常驻扫描节点
+
 """
 
 from launch import LaunchDescription
 from launch.actions import DeclareLaunchArgument
+from launch.conditions import IfCondition
 from launch.substitutions import LaunchConfiguration
 from launch_ros.actions import Node
 
@@ -20,6 +23,14 @@ def generate_launch_description() -> LaunchDescription:
             "dry_run",
             default_value="true",
             description="true=不加载模型、不推理，直接返回模拟结果",
+        ),
+        DeclareLaunchArgument(
+            "start_scan",
+            default_value="false",
+            description=(
+                "true=同时启动常驻扫描节点（持续推理发 /fire_inspection/detection）；"
+                "默认 false，避免与 InspectPoi 服务端争抢 GPU/相机"
+            ),
         ),
     ]
 
@@ -37,6 +48,7 @@ def generate_launch_description() -> LaunchDescription:
         name="vision_scan",
         output="screen",
         parameters=[{"dry_run": LaunchConfiguration("dry_run")}],
+        condition=IfCondition(LaunchConfiguration("start_scan")),
     )
 
     return LaunchDescription(args + [inspect_action_server, vision_scan_node])
