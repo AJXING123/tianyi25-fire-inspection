@@ -11,10 +11,22 @@ WorkingDirectory=/home/nvidia/fire-inspection/fire_inspection_ws
 # 文件格式：
 #   DINGTALK_ACCESS_TOKEN=你的access_token
 #   DINGTALK_SECRET=你的加签密钥
-# 文件不存在或为空时钉钉推送自动关闭
+# 第二个钉钉群（正式群，可选）：
+#   DINGTALK2_ENABLED=true
+#   DINGTALK2_ACCESS_TOKEN=正式群的access_token
+#   DINGTALK2_SECRET=正式群的加签密钥
+# 阿里云 OSS（可选，用于把抓拍图嵌进钉钉卡片）：
+#   OSS_ENABLED=true
+#   OSS_ENDPOINT=oss-cn-shanghai.aliyuncs.com
+#   OSS_BUCKET=你的bucket（建议私有读）
+#   OSS_ACCESS_KEY_ID=RAM子账号AK
+#   OSS_ACCESS_KEY_SECRET=RAM子账号SK
+# 文件不存在或为空时对应功能自动关闭
 EnvironmentFile=-/home/nvidia/fire-inspection/dingtalk.env
 Environment=DINGTALK_ENABLED=true
-ExecStart=/bin/bash -c 'source /opt/ros/jazzy/setup.bash && source /home/nvidia/fire-inspection/fire_inspection_ws/install/setup.bash && exec ros2 run fire_inspection_orchestrator orchestrator_node --ros-args -p auto_start:=false -p dingtalk_enabled:=${DINGTALK_ENABLED:-false} -p dingtalk_access_token:=${DINGTALK_ACCESS_TOKEN:-} -p dingtalk_secret:=${DINGTALK_SECRET:-} -r __node:=fire_inspection_orchestrator'
+# 注意：ros2 --ros-args 不接受空值（-p foo:= 会解析失败），
+# 因此这里先拼装非空参数，再 exec，避免空环境变量导致节点起不来。
+ExecStart=/bin/bash -c 'source /opt/ros/jazzy/setup.bash && source /home/nvidia/fire-inspection/fire_inspection_ws/install/setup.bash && A="-p auto_start:=false"; A="$A -p dingtalk_enabled:=${DINGTALK_ENABLED:-false}"; [ -n "$DINGTALK_ACCESS_TOKEN" ] && A="$A -p dingtalk_access_token:=$DINGTALK_ACCESS_TOKEN"; [ -n "$DINGTALK_SECRET" ] && A="$A -p dingtalk_secret:=$DINGTALK_SECRET"; A="$A -p dingtalk2_enabled:=${DINGTALK2_ENABLED:-false}"; [ -n "$DINGTALK2_ACCESS_TOKEN" ] && A="$A -p dingtalk2_access_token:=$DINGTALK2_ACCESS_TOKEN"; [ -n "$DINGTALK2_SECRET" ] && A="$A -p dingtalk2_secret:=$DINGTALK2_SECRET"; A="$A -p oss_enabled:=${OSS_ENABLED:-false}"; [ -n "$OSS_ENDPOINT" ] && A="$A -p oss_endpoint:=$OSS_ENDPOINT"; [ -n "$OSS_BUCKET" ] && A="$A -p oss_bucket:=$OSS_BUCKET"; [ -n "$OSS_ACCESS_KEY_ID" ] && A="$A -p oss_access_key_id:=$OSS_ACCESS_KEY_ID"; [ -n "$OSS_ACCESS_KEY_SECRET" ] && A="$A -p oss_access_key_secret:=$OSS_ACCESS_KEY_SECRET"; A="$A -p oss_url_expire_s:=${OSS_URL_EXPIRE_S:-604800}"; exec ros2 run fire_inspection_orchestrator orchestrator_node --ros-args $A -r __node:=fire_inspection_orchestrator'
 Restart=on-failure
 RestartSec=5
 
