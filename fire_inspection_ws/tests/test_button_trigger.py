@@ -6,8 +6,8 @@
     时唯一可靠的修复手段），路径带空格要能用，空脚本项要跳过；
   - default_setup_scripts：至少包含 ROS / xos / 本工作区三份环境脚本，
     且推导出的文件真实存在；
-  - 按键事件过滤：B 键按下才触发、键位保持不动不重复、连按去抖、
-    运行中再按走终止分支。
+  - 按键事件过滤：G 拨左后 B 键才生效（启动与停止都要求），
+    G 不在左档不启动也不停止、键位保持不动不重复、连按去抖。
 
 运行前需已 source ROS 环境与工作区 install：
     source /opt/ros/jazzy/setup.bash
@@ -170,9 +170,12 @@ def _fake_node(running=False):
     """构造不连 ROS 的节点实例，只保留按键路径需要的字段。"""
     inst = object.__new__(ButtonTrigger)
     inst.get_logger = lambda: _NoopLogger()
-    inst._names = {}
+    inst._names = button_mod._key_names()
     inst.launch_stack = False
     inst.trigger_key = int(SbusData.KEY_B_DOWN)
+    inst.arm_key = int(SbusData.KEY_G_LEFT)
+    inst._arm_keys = button_mod.key_group(inst._names, inst.arm_key)
+    inst._arm_state = inst.arm_key
     inst.debounce = 2.0
     inst.stop_on_second = True
     inst._last_trigger = 0.0
@@ -206,10 +209,49 @@ def _evt(new, old):
 
 @case
 def test_b_down_triggers_once():
-    """按下 B（KEY_B_DOWN，旧键态为松开）→ 启动一次巡检。"""
+    """G 已在左档时按下 B（KEY_B_DOWN，旧键态为松开）→ 启动一次巡检。"""
     node = _fake_node()
     node._on_key_event(_evt(SbusData.KEY_B_DOWN, SbusData.KEY_NONE))
     assert node.calls == ["start"], node.calls
+
+
+@case
+def test_b_without_g_left_does_not_start():
+    """未先把 G 拨到左档（或还没收到 G 事件）时，按 B 不得启动。"""
+    node = _fake_node()
+    node._arm_state = None
+    node._on_key_event(_evt(SbusData.KEY_B_DOWN, SbusData.KEY_NONE))
+    assert node.calls == [], node.calls
+
+
+@case
+def test_g_left_then_b_starts():
+    """G 拨到左档后再按 B → 启动。"""
+    node = _fake_node()
+    node._arm_state = None
+    node._on_key_event(_evt(SbusData.KEY_G_LEFT, SbusData.KEY_G_MID))
+    node._on_key_event(_evt(SbusData.KEY_B_DOWN, SbusData.KEY_NONE))
+    assert node.calls == ["start"], node.calls
+
+
+@case
+def test_g_back_to_mid_disarms():
+    """G 拨回中档后 B 不再启动，必须重新拨左。"""
+    node = _fake_node()
+    node._arm_state = None
+    node._on_key_event(_evt(SbusData.KEY_G_LEFT, SbusData.KEY_G_MID))
+    node._on_key_event(_evt(SbusData.KEY_G_MID, SbusData.KEY_G_LEFT))
+    node._on_key_event(_evt(SbusData.KEY_B_DOWN, SbusData.KEY_NONE))
+    assert node.calls == [], node.calls
+
+
+@case
+def test_g_does_not_trigger_start():
+    """G 拨左本身只是预置，按 G 不能启动巡检。"""
+    node = _fake_node()
+    node._arm_state = None
+    node._on_key_event(_evt(SbusData.KEY_G_LEFT, SbusData.KEY_G_MID))
+    assert node.calls == [], node.calls
 
 
 @case
@@ -256,6 +298,19 @@ def test_second_press_while_running_requests_stop():
 
 
 @case
+def test_stop_requires_g_left():
+    """G 不在左档时按 B 不得终止巡检；G 拨左后再按 B 才停止。"""
+    node = _fake_node(running=True)
+    node._arm_state = None
+    node._last_trigger = -100.0
+    node._on_key_event(_evt(SbusData.KEY_B_DOWN, SbusData.KEY_NONE))
+    assert node.calls == [], node.calls
+    node._on_key_event(_evt(SbusData.KEY_G_LEFT, SbusData.KEY_G_MID))
+    node._on_key_event(_evt(SbusData.KEY_B_DOWN, SbusData.KEY_NONE))
+    assert node.calls == ["stop"], node.calls
+
+
+@case
 def test_press_during_terminal_grace_queues_restart():
     """终态宽限期内按 B 视为重新开始，不再多按一次去「停止」。"""
     node = _state_node()
@@ -264,6 +319,18 @@ def test_press_during_terminal_grace_queues_restart():
     node._on_key_event(_evt(SbusData.KEY_B_DOWN, SbusData.KEY_NONE))
     assert node.calls == [], node.calls
     assert node._restart_pending is True
+
+
+@case
+def test_press_during_terminal_grace_without_arm_ignored():
+    """终态宽限期内 G 不在左档：不排队重新开始。"""
+    node = _state_node()
+    node._arm_state = None
+    node._stop_at = 1.0
+    node._last_trigger = -100.0
+    node._on_key_event(_evt(SbusData.KEY_B_DOWN, SbusData.KEY_NONE))
+    assert node.calls == [], node.calls
+    assert node._restart_pending is False
 
 
 @case
