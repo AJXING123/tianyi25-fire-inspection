@@ -10,21 +10,22 @@
 - **构建**：colcon（`ament_cmake` + `ament_python`）
 - **语言**：Python 3（`rclpy`）
 
-> ⚠️ **当前阶段：导航（dry_run + 实机运动）、视觉检查、头部扫视已实现；语音与编排层为骨架**
+> ⚠️ **当前阶段：导航（dry_run + 实机运动）、视觉检查、头部扫视、语音、编排层、听觉告警均已实现**
 >
 > | 模块 | 状态 |
 > | --- | --- |
 > | `fire_inspection_nav` | ✅ dry_run 只读链路 + 实机轨道运动（AEB、到点转向、限速备份回滚、取消、超时、返回起点） |
 > | `fire_inspection_vision` | ✅ InspectPoi 服务端（头部相机取图 + YOLO 推理 + 判定，无模型/无图/超时绝不判正常） |
 > | `fire_inspection_head` | ✅ 头部扫视服务端（`/fire_inspection/head_sweep_cmd` 控制、手柄急停、systemd 自启） |
-> | `fire_inspection_voice` | ⬜ 骨架，未注册 Action、不调 TTS |
-> | `fire_inspection_orchestrator` | ⬜ 骨架，未实现状态机 |
+> | `fire_inspection_audio` | ✅ 听觉告警（`/fire_inspection/audio_alert`，命中防空警报样本时通知编排层） |
+> | `fire_inspection_voice` | ✅ Speak Action 服务端（平台 TTS、串行播报、完成判定防抖） |
+> | `fire_inspection_orchestrator` | ✅ 状态机（点位循环、人员介入、跳过/返回起点、异常抓拍与钉钉推送） |
 >
 > **实机运动已实现**：起点与过点点位（`POI_04`）走点对点，巡检段沿 `tracks.outbound`，
-> 返程沿 `tracks.return`；轨道到点后原地转向到点位朝向（`POI_03` 以地图中的 -60° 为准），
+> 返程沿 `tracks.return`；轨道到点后原地转向到点位朝向（`POI_03` 由 `yaw_overrides` 覆盖为 -90°），
 > 校验实际朝向，偏差超过 0.10 rad 重试一次；若轨道末航点朝向已一致则不补转。
-> 每个巡检点位转向完成后停留 `dwell_s`（默认 5s），`dwell_overrides` 可按点位覆盖
-> （`POI_01`/`POI_02` 停 5s、`POI_04` 停 3s），起点与返程不停留。
+> 每个巡检点位转向完成后按 `dwell_overrides` 停留
+> （`POI_01`/`POI_02`/`POI_03` 停 1s、`POI_04` 停 3s），起点与返程不停留。
 > 注意：底盘固件会忽略 `move_to_locations` 的 `target_position.yaw`，且跨全图的点对点返程会规划失败，因此返程必须走轨道。
 > 每段运动前开 AEB、轮询动作状态到终态，成功/失败/取消都会停车并关 AEB。
 > 实机模式启动时严格校验定位（`slam_status != 0` 直接拒绝所有 goal）与底盘健康（A/B 类故障直接拒绝并输出 DTC；C 类告警如「WiFi 未连接」只记 WARN 不拦车——底盘 `hasFatal` 是聚合标志，WiFi 断连也会置真）。
@@ -73,7 +74,8 @@ fire_inspection_ws/
 │   ├── fire_inspection_voice/           # ③ 语音播报服务端（Speak Action）
 │   ├── fire_inspection_vision/          # ④ 视觉检查服务端（InspectPoi Action）
 │   ├── fire_inspection_head/            # ⑤ 头部扫视服务端（/head/cmd + 手柄急停）
-│   └── fire_inspection_orchestrator/    # ⑥ 编排层（唯一指挥者 / 唯一状态机 + 一键 bringup）
+│   ├── fire_inspection_audio/           # ⑥ 听觉告警服务端（样本匹配 → /audio_alert）
+│   └── fire_inspection_orchestrator/    # ⑦ 编排层（唯一指挥者 / 唯一状态机 + 一键 bringup）
 ├── build/  install/  log/               # colcon 产物（不入库）
 └── README.md
 ```
@@ -84,12 +86,13 @@ fire_inspection_ws/
 
 | # | 包 | 类型 | 职责 | 可执行入口 |
 | --- | --- | --- | --- | --- |
-| ① | `fire_inspection_interfaces` | `ament_cmake` | 7 个自建接口（3 msg / 1 srv / 3 action） | —（接口包） |
+| ① | `fire_inspection_interfaces` | `ament_cmake` | 8 个自建接口（3 msg / 1 srv / 4 action） | —（接口包） |
 | ② | `fire_inspection_nav` | `ament_python` | 底盘 REST 导航服务端，沿轨道逐点到点 | `navigate_to_server` |
 | ③ | `fire_inspection_voice` | `ament_python` | 平台 TTS 播报服务端 | `speak_action_server` |
 | ④ | `fire_inspection_vision` | `ament_python` | 取图 + YOLO，判定点位设施是否正常 | `inspect_action_server` |
 | ⑤ | `fire_inspection_head` | `ament_python` | 头部扫视，按配置序列下发 `/head/cmd`，手柄可急停 | `head_sweep_server` |
-| ⑥ | `fire_inspection_orchestrator` | `ament_python` | 状态机，按点位顺序调用三个 Action | `orchestrator_node` |
+| ⑥ | `fire_inspection_audio` | `ament_python` | 听觉告警，命中样本后发布 `/fire_inspection/audio_alert` | `audio_scan_node` |
+| ⑦ | `fire_inspection_orchestrator` | `ament_python` | 状态机，按点位顺序调用四个 Action | `orchestrator_node` |
 
 ### 自建接口
 
@@ -147,6 +150,8 @@ fire_inspection_head ──（独立链路：直接下发 /head/cmd，不经过�
 **导航**：`fire_inspection_nav` → 底盘 REST `:9090`，发起前校验定位正常、目标 POI 存在。
 **语音**：`fire_inspection_voice` → 平台 TTS 服务，说完一句再进入下一点位，避免抢播。
 **视觉**：`fire_inspection_vision` → 取一帧图像做推理，按“异常优先、不确定不判正常”的规则给出结论。
+**人员避让**：编排层按视觉给出的方位角/距离调用 `ApproachTarget`（同样由 `fire_inspection_nav` 执行）。
+**听觉**：`fire_inspection_audio` 命中防空警报样本后发布 `/fire_inspection/audio_alert`，由编排层统一播报。
 
 ### 巡检流程
 
@@ -160,8 +165,17 @@ IDLE → INIT（前置校验 + 限速设置） → TO_START
 默认点位顺序（可在 `fire_inspection_nav/config/pois.yaml` 调整）：
 
 ```
-start_point → POI_01 → POI_02 → POI_03
+start_point → POI_01 → POI_02 → POI_03 → POI_04（过点，不检查）→ 返回起点
 ```
+
+各点位检查项（唯一真源为 `fire_inspection_orchestrator/config/inspection_script.yaml`）：
+
+| 点位 | 检查项 | 说明 |
+| --- | --- | --- |
+| `POI_01` | 灭火器 | 只检查灭火器；未检出即 `UNCERTAIN`，不检查安全指示牌 |
+| `POI_02` | 安全指示牌 | 期望 `safety_sign` |
+| `POI_03` | 安全指示牌 | 期望 `safety_sign` |
+| `POI_04` | — | `transit_pois`，只经过，不做视觉检查 |
 
 ### 判定规则（视觉）
 
@@ -180,14 +194,16 @@ start_point → POI_01 → POI_02 → POI_03
 
 | 命令 | 作用 | 归属包 |
 | --- | --- | --- |
-| `ros2 launch fire_inspection_orchestrator inspection_bringup.launch.py` | **一键全链路**（导航 + 语音 + 视觉 + 编排） | orchestrator |
+| `ros2 launch fire_inspection_orchestrator inspection_bringup.launch.py` | **一键全链路**（头部 + 语音 + 视觉 + 听觉 + 编排） | orchestrator |
 | `ros2 launch fire_inspection_nav navigate_to.launch.py` | 仅导航服务端 | nav |
 | `ros2 launch fire_inspection_voice speak.launch.py` | 仅语音服务端 | voice |
 | `ros2 launch fire_inspection_vision inspect.launch.py` | 仅视觉服务端 | vision |
 | `ros2 launch fire_inspection_head head_sweep.launch.py` | 仅头部扫视（`auto_start:=true` 可延时自启） | head |
+| `ros2 launch fire_inspection_audio audio_scan.launch.py` | 仅听觉告警 | audio |
 | `ros2 launch fire_inspection_orchestrator orchestrator.launch.py` | 仅编排层（调试用） | orchestrator |
 
-所有 launch 均支持 `dry_run:=true|false`；`inspection_bringup.launch.py` 会把该参数透传给四个子链路。
+所有 launch 均支持 `dry_run:=true|false`；`inspection_bringup.launch.py` 会把该参数透传给各子链路
+（导航 / 语音 / 视觉 / 头部 / 听觉），`start_audio:=false` 可跳过听觉节点。
 
 > 只想听声音、不动车：`inspection_bringup.launch.py dry_run:=true speak_dry_run:=false`
 > （`speak_dry_run` 默认跟随 `dry_run`；按键触发节点对应参数是 `speak_real:=true`）。
@@ -281,8 +297,8 @@ curl -s http://192.168.11.10:9090/api/core/slam/v1/localization/status
   前置校验会告警"轨道航点朝向 vs 点位朝向"不一致：想让车到点即朝向规定角度，
   需在图中把对应轨道末端航点朝向改成点位朝向（不依赖到点补转）；
 - 每个点位到点后按 `_dwell_for` 停留：起点与返程 0s；`dwell_overrides` 优先
-  （`POI_04` 为 3s）；未单独配置的 `transit_pois` 0s；其余巡检点位 `dwell_s`（默认 5s）；
-  停留期间可被取消；
+  （`POI_01`/`POI_02`/`POI_03` 为 1s、`POI_04` 为 3s）；未单独配置的 `transit_pois` 0s；
+  其余巡检点位 `dwell_s`（默认 5s）；停留期间可被取消；
 - 返程沿 `tracks.return`（POI_04 → 起点）返回，到点后同样转向到起点朝向；
   跨全图的点对点返程在底盘上会规划失败，不要使用；
 - 返程被介入/取消打断后重发时，导航会传 `move_to_locations(start_position=当前轨道投影,
@@ -294,7 +310,7 @@ curl -s http://192.168.11.10:9090/api/core/slam/v1/localization/status
 ### 5.3 吸烟人员介入（默认：停车 → 侧向绕开 → 继续巡检）
 
 > 默认配置把 `smoking` 放在 `intervention.avoid_classes` 里：确认后先停车，
-> 再按视觉方位角向**远离人员的一侧**横移 `avoid_offset_m`（默认 1.5m，导航侧做
+> 再按视觉方位角向**远离人员的一侧**横移 `avoid_offset_m`（默认 0.8m，导航侧做
 > 走廊/软限位校验），播报后重发原目标继续巡检。
 > 只播报不停车用 `speak_only_classes`；「走到人前方 2m」用 `approach` 流程。
 > 无有效方位角/测距时不会盲动，退化为只停车播报。
@@ -323,8 +339,8 @@ curl -s http://192.168.11.10:9090/api/core/slam/v1/localization/status
   `range<=0` / 小于 `min_range_m` / 大于 `max_range_m` / 需位移超过 `max_travel_m` /
   接近点超软限位 → 一律 `skipped`，原地转向后播报；接近段单独限速 `speed_mps`（默认 0.35）；
   位移小于 0.3m 时只原地转向，不前后挪动；
-- 防重复：`intervention.max_per_poi`（默认 1）限制同一点位介入次数，
-  `intervention.max_total`（默认 5）限制本轮总次数，介入结束后进入 `cooldown_s` 冷却；
+- 防重复：`intervention.max_per_poi`（默认 3）限制同一点位介入次数，
+  `intervention.max_total`（默认 10）限制本轮总次数，介入结束后进入 `cooldown_s` 冷却；
   两者配成 `0`（不限）时仍有一道路段硬上限（同一段路最多 3 次），
   达到后本段剩余路程只播报、不再停车接近，避免巡检被一个人卡死；
 - 到点与取消同时发生（取消生效前已到点）：就地介入并**不再接近**，避免离开点位导致后续
@@ -355,11 +371,14 @@ ros2 action send_goal /fire_inspection/approach_target \
 | `fire_inspection_voice/config/voice.yaml` | TTS 服务名、`audio_id`、完成判定时序 | 完成判定只认 `status == "playing"` |
 | `fire_inspection_vision/config/vision.yaml` | 相机、模型路径、置信度、超时、深度测距与视场角 | 模型路径留空即视为 `NO_MODEL`；FOV 与编排层 `hfov_deg`/`vfov_deg` 必须同源 |
 | `fire_inspection_head/config/head_sweep.yaml` | 扫视序列、节奏、发布频率、手柄急停键 | 改参数需重启节点，不用重编译 |
+| `fire_inspection_audio/config/audio.yaml` | 听觉样本、匹配阈值、冷却、音频源（lyre / sounddevice） | 样本纯名即 `/fire_inspection/audio_alert` 的 payload |
 | `fire_inspection_orchestrator/config/inspection_script.yaml` | 点位检查项、播报文案、流程开关、吸烟介入策略（`intervention`） | 流程编排的唯一真源；介入只管策略，安全边界在 `pois.yaml` |
 
-> **模型权重不入库**（见仓库根 `.gitignore`）：手工把权重放到仓库根的 `models/`，
-> 例如 `models/fire_3cls_v2.pt`，并让 `vision.yaml` 的 `model_path` 指向它。
-> 权重缺失时视觉结果为 `NO_MODEL`，不会把点位判为正常。
+> **模型权重不入库**（见仓库根 `.gitignore`）：手工把权重放到仓库根的 `models/`：
+> `fire_3cls_v2.pt`（消防三分类）、`person_yolov8n.pt`（行人）、
+> `smoking_cigarette_yolo11m.pt`（香烟）、`person_pose_yolo11n.pt`（吸烟姿态门控），
+> 并在 `vision.yaml` 对应的 `model_path` 中指向它们。
+> 主模型缺失时视觉结果为 `NO_MODEL`，不会把点位判为正常。
 
 ---
 
@@ -398,7 +417,7 @@ export ROS_LOG_DIR=$HOME/.ros/log
 ## 9. 开发约定
 
 - 🔴 **接口冻结**：`fire_inspection_interfaces` 的字段顺序、语义变更必须同步所有使用方，禁止单侧改动。
-- 🔴 **单一指挥者**：只有 `fire_inspection_orchestrator` 调用三个 Action，模块之间禁止互调。
+- 🔴 **单一指挥者**：只有 `fire_inspection_orchestrator` 调用四个 Action（`NavigateTo` / `Speak` / `InspectPoi` / `ApproachTarget`），模块之间禁止互调。
 - 🔴 **判定保守**：视觉结果不确定、超时、无图、无模型，一律不得落成 `NORMAL`。
 - 🔴 **语音平台语义**：`stop` 只能带空文本打断；新文本用 `append`；完成判定需防抖 + 时长估算兜底。
 - 🔴 **限速可回滚**：限速参数写入前备份原值，失败必须回滚，禁止猜测原值。

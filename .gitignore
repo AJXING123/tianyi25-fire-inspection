@@ -34,3 +34,17 @@ dingtalk.env
 
 # 运行时数据：断网时积压的钉钉待发消息
 fire_inspection_ws/dingtalk_queue/
+
+# 运行时数据：抓拍图（与本地 7 天自动清理一致）
+fire_inspection_ws/picture/
+
+# 运行时数据：桥接 outbox、音频片段缓存
+fire_inspection_ws/data/bridge/outbox.json
+audio_cache/
+
+# 备份文件：*.bak 是之前调试时手动存的
+*.bak
+backups/
+
+# 调试脚本（可按需保留，默认忽略）
+test_dingtalk.py

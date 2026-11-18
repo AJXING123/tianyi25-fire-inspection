@@ -22,6 +22,9 @@ def generate_launch_description() -> LaunchDescription:
             description="触发键位编码（SbusData.key_event_new）：3=B_UP 4=B_DOWN；"
                         "A(1/2) 被平台自检占用，其余键位见 SbusData.KEY_*"),
         DeclareLaunchArgument(
+            "arm_key", default_value="15",
+            description="启动预置键位：默认 15=KEY_G_LEFT，G 拨到左档后才允许触发键启动"),
+        DeclareLaunchArgument(
             "dry_run", default_value="false",
             description="true=按键只跑模拟链路（不动底盘不出声）",
         ),
@@ -57,6 +60,7 @@ def generate_launch_description() -> LaunchDescription:
         output="screen",
         parameters=[{
             "trigger_key": LaunchConfiguration("trigger_key"),
+            "arm_key": LaunchConfiguration("arm_key"),
             "dry_run": LaunchConfiguration("dry_run"),
             "start_head": LaunchConfiguration("start_head"),
             "transit_watch": LaunchConfiguration("transit_watch"),

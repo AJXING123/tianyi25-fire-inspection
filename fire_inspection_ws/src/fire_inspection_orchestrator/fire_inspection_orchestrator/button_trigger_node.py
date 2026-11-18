@@ -2,7 +2,8 @@
 
 链路（推荐，launch_stack=false）:
     /sbus_data/event (bodyctrl_msgs/SbusData)
-      -> 本节点识别指定 key_event_new（默认 KEY_B_DOWN，A 键由平台自检占用）
+      -> 本节点跟踪预置键位（默认 G 键档位），把 G 拨到左档后才允许启动
+      -> 识别指定 key_event_new（默认 KEY_B_DOWN，A 键由平台自检占用）
       -> 请求 /fire_inspection/control (cmd=start|stop) 启停常驻编排层
       -> 订阅 /fire_inspection/state 判断当前是否正在巡检
 
@@ -11,6 +12,9 @@
       -> 订阅 /fire_inspection/state，收到 done/stopped/aborted 后关闭本次 launch
 
 语义约定：
+- 启动与停止都必须先满足预置条件：G 键拨到左档（`arm_key`），再按触发键；
+  G 不在左档时按 B 只告警、不动作（防止误触）；
+- 预置条件只看 G 的**当前档位**：G 拨回中/右后按 B 不会启动也不会停止；
 - 巡检未运行时按键 = 启动本轮巡检（常驻模式只发 start，不重复拉起节点）；
 - 巡检运行中按键 = 请求终止本轮（调 /fire_inspection/control cmd=stop，
   由编排层取消当前动作并安全收尾；launch 模式下失败/超时才会关闭自己拉起的 launch）；
@@ -99,6 +103,19 @@ def _key_names():
     }
 
 
+def key_group(names, key):
+    """同一物理开关的所有档位编码（如 KEY_G_LEFT/MID/RIGHT）。
+
+    只有三档开关才需要跟踪离开预置档，点动键（KEY_B_DOWN 等）退化为自身。
+    """
+    name = names.get(key, "")
+    parts = name.split("_")
+    if len(parts) < 3 or parts[0] != "KEY":
+        return {key}
+    prefix = f"KEY_{parts[1]}_"
+    return {code for code, n in names.items() if n.startswith(prefix)}
+
+
 class ButtonTrigger(Node):
     def __init__(self) -> None:
         super().__init__("inspection_button_trigger")
@@ -106,6 +123,8 @@ class ButtonTrigger(Node):
         self.declare_parameter("event_topic", "/sbus_data/event")
         # 默认 B 点动键（A 被平台 proc_manager 用于开机自检，不能占用）
         self.declare_parameter("trigger_key", int(SbusData.KEY_B_DOWN))
+        # 启动预置键位：G 拨到左档后才允许按 B 启动巡检（防误触）
+        self.declare_parameter("arm_key", int(SbusData.KEY_G_LEFT))
         self.declare_parameter("state_topic", "/fire_inspection/state")
         self.declare_parameter("launch_pkg", "fire_inspection_orchestrator")
         self.declare_parameter("launch_file", "inspection_bringup.launch.py")
@@ -148,6 +167,7 @@ class ButtonTrigger(Node):
         self.declare_parameter("start_retry_timeout_s", 60.0)
 
         self.trigger_key = int(self.get_parameter("trigger_key").value)
+        self.arm_key = int(self.get_parameter("arm_key").value)
         self.debounce = float(self.get_parameter("debounce_s").value)
         self.stop_on_done = bool(self.get_parameter("stop_on_done").value)
         self.launch_stack = bool(self.get_parameter("launch_stack").value)
@@ -166,6 +186,9 @@ class ButtonTrigger(Node):
             self.get_parameter("start_retry_timeout_s").value)
 
         self._names = _key_names()
+        self._arm_keys = key_group(self._names, self.arm_key)
+        # 最近一次收到的预置开关档位；None 表示节点启动后还没收到过 G 键事件
+        self._arm_state = None
         self._proc = None
         self._started_at = None
         self._log_fp = None
@@ -217,7 +240,8 @@ class ButtonTrigger(Node):
         self._timer = self.create_timer(0.5, self._poll)
 
         self.get_logger().info(
-            f"按键触发就绪：{self._names.get(self.trigger_key, self.trigger_key)}"
+            f"按键触发就绪：{self._names.get(self.arm_key, self.arm_key)} + "
+            f"{self._names.get(self.trigger_key, self.trigger_key)}"
             f" -> {'常驻控制服务 start/stop' if not self.launch_stack else 'inspection_bringup'} "
             f"dry_run={bool(self.get_parameter('dry_run').value)} "
             f"speak_real={bool(self.get_parameter('speak_real').value)} "
@@ -306,11 +330,22 @@ class ButtonTrigger(Node):
     # ---------------- 按键 ----------------
     def _on_key_event(self, msg: SbusData) -> None:
         key = int(msg.key_event_new)
+        # 预置开关（G）只更新档位，不参与触发；每次事件都更新，包括 old == new
+        if key in self._arm_keys:
+            self._arm_state = key
         if key != self.trigger_key or int(msg.key_event_old) == key:
             return
         now = time.monotonic()
         if now - self._last_trigger < self.debounce:
             self.get_logger().info("按键抖动/连按过快，忽略")
+            return
+        # 启动 / 停止 / 重新开始都要求 G 在左档：G 不在左档时按键一律忽略，
+        # 检查放在去抖之前，避免"先误按、再补拨 G"被去抖挡掉。
+        if self._arm_state != self.arm_key:
+            self.get_logger().warn(
+                "未满足操作条件：需先把 "
+                f"{self._names.get(self.arm_key, self.arm_key)} 拨到左档再按键，"
+                "已忽略本次按键")
             return
         self._last_trigger = now
         if self._running():
